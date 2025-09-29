@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  email-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_ENCRYPTION_KEY=your-32-byte-encryption-key-here-1234567890123456
+      - JWT_SECRET_KEY=your-jwt-secret-key-should-be-long-and-secure-1234567890
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - ./temp:/app/temp
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+volumes:
+  redis_data:

@@ -1,0 +1,849 @@
+# Python Email Service Requirements
+
+## 🎯 Project Overview
+
+**Project Name**: Python Email Service API  
+**Type**: RESTful API service with background email processing  
+**Database**: Microsoft SQL Server  
+**Key Features**: Email queue processing, scheduled processing, configuration management, dashboard monitoring
+
+## 🏗️ Core Architecture
+
+### Framework & Dependencies
+```python
+# Core Framework
+fastapi==0.104.0
+uvicorn[standard]==0.24.0
+
+# Database
+pyodbc==5.0.0
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+
+# Email
+aiosmtplib==3.0.0
+email-validator==2.1.0
+
+# Background Tasks
+celery==5.3.4
+redis==5.0.1  # For Celery broker
+apscheduler==3.10.4  # Alternative scheduler
+
+# Security & Encryption
+bcrypt==4.1.2
+pycryptodome==3.19.0
+python-jose[cryptography]==3.3.0
+
+# Configuration & Environment
+pydantic==2.5.0
+python-dotenv==1.0.0
+pydantic-settings==2.1.0
+
+# File Handling
+aiofiles==23.2.1
+python-multipart==0.0.6
+
+# Process Management
+psutil==5.9.6
+
+# Logging & Monitoring
+structlog==23.2.0
+```
+
+## 📊 Database Schema
+
+### Required Tables
+```sql
+-- Email Configuration Table
+CREATE TABLE tbl_EMailParameters (
+    SMTPServer NVARCHAR(255),
+    SMTPPort INT,
+    SMTPAccountName NVARCHAR(255),
+    SMTPPassword NVARCHAR(255),
+    SMTPMailId NVARCHAR(255),
+    ApplicationName NVARCHAR(255),
+    SMTPSSLFlag NVARCHAR(1),
+    ParamCode NVARCHAR(50),
+    IsActive NVARCHAR(1)
+);
+
+-- Email Queue Table
+CREATE TABLE Digital_Emaildetails (
+    dd_srno INT IDENTITY(1,1) PRIMARY KEY,
+    dd_document VARBINARY(MAX),
+    dd_filename NVARCHAR(255),
+    dd_toEmailid NVARCHAR(500),
+    dd_ccEmailid NVARCHAR(500),
+    dd_subject NVARCHAR(500),
+    dd_bodyText NTEXT,
+    dd_SendFlag NVARCHAR(1) DEFAULT 'N',
+    dd_EmailParamCode NVARCHAR(50),
+    dd_RetryCount INT DEFAULT 0,
+    dd_SentDate DATETIME,
+    dd_BounceReason NVARCHAR(500),
+    dd_LastRetryDate DATETIME
+);
+```
+
+## 🔧 API Endpoints & Functionality
+
+### 1. Authentication APIs
+```python
+# POST /api/authenticate
+# Body: {"username": "admin", "password": "admin123"}
+# Response: {"success": true, "token": "jwt_token", "user": {...}}
+
+# GET /api/authenticate (verify token)
+# Headers: Authorization: Bearer <token>
+# Response: {"success": true, "user": {...}}
+```
+
+### 2. Configuration Management APIs
+```python
+# Database Configuration
+# POST /api/save-config
+# Body: {"server": "localhost", "port": "1433", "user": "sa", "password": "pass", "database": "EmailDB"}
+# Response: {"success": true, "message": "Configuration saved successfully"}
+
+# GET /api/get-current-config
+# Response: {"success": true, "config": {"database": {...}, "email": {...}}}
+
+# GET /api/check-db-config
+# Response: {"exists": true}
+
+# Email Configuration  
+# POST /api/save-email-config
+# Body: {
+#   "startTime": "09:00", 
+#   "endTime": "18:00", 
+#   "interval": 30, 
+#   "intervalUnit": "minutes",
+#   "dbRequestTimeout": 30000,
+#   "dbConnectionTimeout": 30000,
+#   "username": "emailuser",
+#   "password": "emailpass"
+# }
+# Response: {"success": true, "message": "Email service configuration saved"}
+
+# GET /api/check-email-config
+# Response: {"exists": true}
+```
+
+### 3. Database & Connection Testing
+```python
+# POST /api/test-connection
+# Body: {"server": "localhost", "port": "1433", "user": "sa", "password": "pass", "database": "EmailDB"}
+# Response: {"success": true, "message": "Database connection successful"}
+
+# POST /api/test-db-status
+# Response: {"success": true, "connected": true, "responseTime": 150, "timestamp": "2025-09-24T10:00:00Z"}
+```
+
+### 4. Email Service Control
+```python
+# POST /api/service-control
+# Body: {"action": "start", "user": "admin"}
+# Response: {"success": true, "message": "Service started successfully", "status": {...}}
+
+# POST /api/service-control
+# Body: {"action": "stop", "user": "admin"}
+# Response: {"success": true, "message": "Service stopped successfully", "status": {...}}
+
+# GET /api/service-status
+# Response: {
+#   "success": true,
+#   "status": "running",
+#   "startedAt": "2025-09-24T09:00:00Z",
+#   "lastActivity": "2025-09-24T10:30:00Z"
+# }
+```
+
+### 5. Email Processing APIs
+```python
+# POST /api/email-test
+# Body: {"email": "test@example.com"}
+# Response: {
+#   "success": true, 
+#   "messageId": "abc123", 
+#   "recipient": "test@example.com"
+# }
+
+# POST /api/email-force-process
+# Response: {
+#   "success": true, 
+#   "message": "Email processing completed successfully",
+#   "timestamp": "2025-09-24T10:30:00Z"
+# }
+```
+
+### 6. Dashboard & Monitoring APIs
+```python
+# GET /api/dashboard
+# Response: {
+#   "database": {
+#     "connected": true,
+#     "server": "localhost",
+#     "database": "EmailDB",
+#     "lastChecked": "2025-09-24T10:30:00Z",
+#     "responseTime": 150
+#   },
+#   "schedule": {
+#     "startTime": "09:00",
+#     "endTime": "18:00",
+#     "interval": 30,
+#     "intervalUnit": "minutes",
+#     "isActive": true
+#   },
+#   "service": {
+#     "status": "running",
+#     "lastRun": "2025-09-24T10:25:00Z",
+#     "nextRun": "2025-09-24T10:55:00Z",
+#     "emailStats": {
+#       "totalProcessed": 150,
+#       "totalSent": 145,
+#       "totalFailed": 5
+#     }
+#   }
+# }
+```
+
+## 🏗️ Core Service Classes
+
+### 1. Database Manager
+```python
+from typing import Optional
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+class DatabaseManager:
+    def __init__(self):
+        self.engine = None
+        self.config = None
+    
+    async def load_config(self) -> DatabaseConfig:
+        """Load database configuration from encrypted file"""
+        pass
+    
+    async def get_connection(self) -> AsyncSession:
+        """Get database connection from pool"""
+        pass
+    
+    async def test_connection(self, config: DatabaseConfig) -> bool:
+        """Test database connection with provided config"""
+        pass
+    
+    async def close_connection(self):
+        """Close database connections"""
+        pass
+```
+
+### 2. Email Service
+```python
+from typing import List, Optional
+import aiosmtplib
+from email.mime.multipart import MIMEMultipart
+
+class EmailService:
+    def __init__(self):
+        self.smtp_transporter = None
+        self.db_manager = DatabaseManager()
+    
+    async def get_smtp_details(self) -> SMTPConfig:
+        """Get SMTP configuration from database"""
+        pass
+    
+    async def get_smtp_details_by_param_code(self, param_code: str) -> SMTPConfig:
+        """Get SMTP configuration by parameter code"""
+        pass
+    
+    async def send_email_with_attachment(self, email_record: EmailRecord) -> EmailResult:
+        """Send email with PDF attachment"""
+        pass
+    
+    async def send_test_email(self, to_email: str) -> EmailResult:
+        """Send test email to verify SMTP configuration"""
+        pass
+    
+    async def get_pending_emails(self) -> List[EmailRecord]:
+        """Get pending emails from database queue"""
+        pass
+    
+    async def update_email_status(self, email_id: int, status: str, message_id: str = None, error: str = None):
+        """Update email status in database"""
+        pass
+    
+    async def process_email_queue(self) -> ProcessingStats:
+        """Process all pending emails in queue"""
+        pass
+```
+
+### 3. Email Worker (Background Service)
+```python
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from typing import Optional
+
+class EmailWorker:
+    def __init__(self):
+        self.scheduler = AsyncIOScheduler()
+        self.is_processing = False
+        self.config = None
+        self.email_service = EmailService()
+    
+    async def start(self):
+        """Start the email worker with scheduled processing"""
+        pass
+    
+    async def stop(self):
+        """Stop the email worker and clear schedules"""
+        pass
+    
+    async def get_status(self) -> WorkerStatus:
+        """Get current worker status"""
+        pass
+    
+    async def force_process_emails(self):
+        """Force process emails immediately"""
+        pass
+    
+    async def load_email_config(self) -> EmailConfig:
+        """Load email configuration from encrypted storage"""
+        pass
+    
+    def is_within_schedule(self, start_time: str, end_time: str) -> bool:
+        """Check if current time is within service schedule"""
+        pass
+```
+
+## 🔐 Security & Configuration
+
+### 1. Configuration Models
+```python
+from pydantic import BaseModel
+from typing import Optional, Literal
+
+class DatabaseConfig(BaseModel):
+    server: str
+    port: int
+    user: str
+    password: str
+    database: str
+
+class EmailConfig(BaseModel):
+    start_time: str
+    end_time: str
+    interval: int
+    interval_unit: Literal["minutes", "hours"]
+    db_request_timeout: int
+    db_connection_timeout: int
+    username: str
+    password: str
+
+class SMTPConfig(BaseModel):
+    smtp_server: str
+    smtp_port: int
+    smtp_account_name: str
+    smtp_password: str
+    smtp_mail_id: str
+    application_name: str
+    smtp_ssl_flag: Optional[str] = None
+    param_code: Optional[str] = None
+    is_active: Optional[str] = "Y"
+
+class EmailRecord(BaseModel):
+    dd_srno: Optional[int] = None
+    dd_document: Optional[bytes] = None
+    dd_filename: Optional[str] = None
+    dd_to_emailid: str
+    dd_cc_emailid: Optional[str] = None
+    dd_subject: str
+    dd_body_text: str
+    dd_send_flag: str = "N"
+    dd_email_param_code: Optional[str] = None
+    dd_retry_count: int = 0
+
+class EmailResult(BaseModel):
+    success: bool
+    message_id: Optional[str] = None
+    recipient: str
+    cc: Optional[str] = None
+    error: Optional[str] = None
+
+class ProcessingStats(BaseModel):
+    processed: int
+    success: int
+    failed: int
+```
+
+### 2. Authentication & Security
+```python
+from cryptography.fernet import Fernet
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+
+class SecurityManager:
+    def __init__(self):
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        self.cipher_suite = Fernet(self.get_encryption_key())
+    
+    def hash_password(self, password: str) -> str:
+        """Hash password using bcrypt"""
+        pass
+    
+    def verify_password(self, plain_password: str, hashed_password: str) -> bool:
+        """Verify password against hash"""
+        pass
+    
+    def create_access_token(self, data: dict) -> str:
+        """Create JWT access token"""
+        pass
+    
+    def verify_token(self, token: str) -> dict:
+        """Verify and decode JWT token"""
+        pass
+    
+    def encrypt_data(self, data: str) -> str:
+        """Encrypt sensitive data"""
+        pass
+    
+    def decrypt_data(self, encrypted_data: str) -> str:
+        """Decrypt sensitive data"""
+        pass
+```
+
+## 📁 File Structure
+```
+email_service_python/
+├── app/
+│   ├── __init__.py
+│   ├── main.py                 # FastAPI app initialization
+│   ├── config/
+│   │   ├── __init__.py
+│   │   ├── database.py         # Database configuration
+│   │   └── settings.py         # App settings
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── auth.py            # Authentication endpoints
+│   │   ├── database.py        # Database configuration endpoints
+│   │   ├── email.py           # Email processing endpoints
+│   │   └── service.py         # Service control endpoints
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── database.py        # Database models
+│   │   ├── email.py           # Email models
+│   │   └── auth.py            # Auth models
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── database_manager.py
+│   │   ├── email_service.py
+│   │   └── email_worker.py
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── security.py        # JWT, encryption
+│   │   └── config.py          # Configuration management
+│   └── utils/
+│       ├── __init__.py
+│       ├── encryption.py      # File encryption utilities
+│       └── file_manager.py    # File handling utilities
+├── config/                    # Configuration files storage
+├── temp/                      # Temporary files
+├── logs/                      # Log files
+├── requirements.txt
+├── .env                       # Environment variables
+├── docker-compose.yml         # Optional Docker setup
+└── README.md
+```
+
+## 🚀 Background Processing
+
+### Celery Setup (Option 1)
+```python
+# celery_app.py
+from celery import Celery
+
+celery_app = Celery(
+    "email_service",
+    broker="redis://localhost:6379",
+    backend="redis://localhost:6379"
+)
+
+@celery_app.task
+def process_email_queue():
+    """Background task for email processing"""
+    from app.services.email_service import EmailService
+    email_service = EmailService()
+    return email_service.process_email_queue()
+
+# Start Celery worker: celery -A celery_app worker --loglevel=info
+# Start Celery beat: celery -A celery_app beat --loglevel=info
+```
+
+### APScheduler Setup (Option 2)
+```python
+# scheduler.py
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+scheduler = AsyncIOScheduler()
+
+async def scheduled_email_processing():
+    """Process emails based on schedule configuration"""
+    from app.services.email_worker import EmailWorker
+    worker = EmailWorker.get_instance()
+    await worker.process_emails()
+
+# Configure scheduler based on email configuration
+def setup_scheduler(start_time: str, end_time: str, interval: int, interval_unit: str):
+    # Clear existing jobs
+    scheduler.remove_all_jobs()
+    
+    # Add new job based on configuration
+    if interval_unit == "minutes":
+        trigger = CronTrigger(minute=f"*/{interval}")
+    else:  # hours
+        trigger = CronTrigger(hour=f"*/{interval}")
+    
+    scheduler.add_job(
+        scheduled_email_processing,
+        trigger=trigger,
+        id="email_processing_job"
+    )
+```
+
+## 🐳 Deployment Configuration
+
+### Docker Setup
+```dockerfile
+# Dockerfile
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    unixodbc \
+    unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create directories
+RUN mkdir -p config temp logs
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### Docker Compose
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  email-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_ENCRYPTION_KEY=${DATABASE_ENCRYPTION_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  celery-worker:
+    build: .
+    command: celery -A celery_app worker --loglevel=info
+    environment:
+      - DATABASE_ENCRYPTION_KEY=${DATABASE_ENCRYPTION_KEY}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+
+  celery-beat:
+    build: .
+    command: celery -A celery_app beat --loglevel=info
+    environment:
+      - DATABASE_ENCRYPTION_KEY=${DATABASE_ENCRYPTION_KEY}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./config:/app/config
+    depends_on:
+      - redis
+
+volumes:
+  redis_data:
+```
+
+### Environment Configuration
+```env
+# .env
+DATABASE_ENCRYPTION_KEY=your-32-byte-encryption-key-here-1234567890123456
+JWT_SECRET_KEY=your-jwt-secret-key-should-be-long-and-secure-1234567890
+REDIS_URL=redis://localhost:6379
+LOG_LEVEL=INFO
+```
+
+## 🧪 Testing & Development
+
+### 1. FastAPI Main Application
+```python
+# app/main.py
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBearer
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api import auth, database, email, service
+from app.core.config import settings
+
+app = FastAPI(
+    title="Email Service API",
+    description="Email processing service with queue management",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth.router, prefix="/api", tags=["authentication"])
+app.include_router(database.router, prefix="/api", tags=["database"])
+app.include_router(email.router, prefix="/api", tags=["email"])
+app.include_router(service.router, prefix="/api", tags=["service"])
+
+@app.get("/")
+async def root():
+    return {"message": "Email Service API is running"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "email-service"}
+```
+
+### 2. Sample API Implementation
+```python
+# app/api/auth.py
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.security import HTTPBearer
+from pydantic import BaseModel
+
+from app.core.security import SecurityManager
+from app.models.auth import LoginRequest, LoginResponse
+
+router = APIRouter()
+security = HTTPBearer()
+security_manager = SecurityManager()
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@router.post("/authenticate", response_model=LoginResponse)
+async def authenticate(request: LoginRequest):
+    """Authenticate user and return JWT token"""
+    # Load stored credentials from encrypted config
+    stored_config = await load_email_config()
+    
+    if request.username == stored_config.username and request.password == stored_config.password:
+        # Generate JWT token
+        token_data = {"username": request.username, "timestamp": time.time()}
+        token = security_manager.create_access_token(token_data)
+        
+        return LoginResponse(
+            success=True,
+            message="Authentication successful",
+            token=token,
+            user={"username": request.username}
+        )
+    else:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password"
+        )
+
+@router.get("/authenticate")
+async def verify_token(token: str = Depends(security)):
+    """Verify JWT token"""
+    try:
+        payload = security_manager.verify_token(token.credentials)
+        return {"success": True, "user": {"username": payload.get("username")}}
+    except JWTError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token"
+        )
+```
+
+### 3. Postman Collection Examples
+
+#### Authentication
+```json
+{
+  "name": "Authenticate",
+  "request": {
+    "method": "POST",
+    "header": [
+      {
+        "key": "Content-Type",
+        "value": "application/json"
+      }
+    ],
+    "body": {
+      "mode": "raw",
+      "raw": "{\n  \"username\": \"admin\",\n  \"password\": \"admin\"\n}"
+    },
+    "url": {
+      "raw": "{{baseUrl}}/api/authenticate",
+      "host": ["{{baseUrl}}"],
+      "path": ["api", "authenticate"]
+    }
+  }
+}
+```
+
+#### Database Configuration
+```json
+{
+  "name": "Configure Database",
+  "request": {
+    "method": "POST",
+    "header": [
+      {
+        "key": "Content-Type",
+        "value": "application/json"
+      },
+      {
+        "key": "Authorization",
+        "value": "Bearer {{authToken}}"
+      }
+    ],
+    "body": {
+      "mode": "raw",
+      "raw": "{\n  \"server\": \"localhost\",\n  \"port\": \"1433\",\n  \"user\": \"sa\",\n  \"password\": \"YourPassword123\",\n  \"database\": \"EmailDB\"\n}"
+    },
+    "url": {
+      "raw": "{{baseUrl}}/api/save-config",
+      "host": ["{{baseUrl}}"],
+      "path": ["api", "save-config"]
+    }
+  }
+}
+```
+
+#### Email Service Configuration
+```json
+{
+  "name": "Configure Email Service",
+  "request": {
+    "method": "POST",
+    "header": [
+      {
+        "key": "Content-Type",
+        "value": "application/json"
+      },
+      {
+        "key": "Authorization",
+        "value": "Bearer {{authToken}}"
+      }
+    ],
+    "body": {
+      "mode": "raw",
+      "raw": "{\n  \"startTime\": \"09:00\",\n  \"endTime\": \"18:00\",\n  \"interval\": 30,\n  \"intervalUnit\": \"minutes\",\n  \"dbRequestTimeout\": 30000,\n  \"dbConnectionTimeout\": 30000,\n  \"username\": \"emailuser\",\n  \"password\": \"emailpass\"\n}"
+    },
+    "url": {
+      "raw": "{{baseUrl}}/api/save-email-config",
+      "host": ["{{baseUrl}}"],
+      "path": ["api", "save-email-config"]
+    }
+  }
+}
+```
+
+## 📋 Implementation Priority
+
+### Phase 1: Core Infrastructure (Week 1-2)
+1. ✅ FastAPI setup with basic routing
+2. ✅ Database connection and configuration management
+3. ✅ Authentication system with JWT
+4. ✅ Configuration encryption and storage
+5. ✅ Basic API endpoints for configuration
+
+### Phase 2: Email Processing Core (Week 3-4)
+1. ✅ Email service implementation
+2. ✅ SMTP configuration and connection management
+3. ✅ Email queue processing logic
+4. ✅ Database operations for email records
+5. ✅ Basic email sending functionality
+
+### Phase 3: Background Processing (Week 5)
+1. ✅ Background worker implementation (Celery or APScheduler)
+2. ✅ Scheduled email processing
+3. ✅ Service control APIs (start/stop)
+4. ✅ Email queue monitoring and statistics
+5. ✅ Error handling and retry logic
+
+### Phase 4: Dashboard & Monitoring (Week 6)
+1. ✅ Dashboard API with comprehensive data
+2. ✅ Service status monitoring
+3. ✅ Database connection monitoring
+4. ✅ Email processing statistics
+5. ✅ Complete testing and documentation
+
+## 🔧 Key Features Summary
+
+### ✅ Authentication & Security
+- JWT-based authentication
+- Encrypted configuration storage
+- Password hashing with bcrypt
+- Secure API endpoints
+
+### ✅ Database Integration
+- SQL Server connection with connection pooling
+- Encrypted configuration management
+- Dynamic SMTP configuration support
+- Email queue management
+
+### ✅ Email Processing
+- Queue-based email processing
+- Scheduled processing with configurable intervals
+- Multiple SMTP configuration support
+- Email with PDF attachments
+- Retry logic and error handling
+
+### ✅ Service Management
+- Start/stop email service
+- Real-time status monitoring
+- Dashboard with comprehensive statistics
+- Configuration management through APIs
+
+### ✅ Background Processing
+- Celery or APScheduler integration
+- Configurable processing schedules
+- Process monitoring and statistics
+- Automatic service management
+
+This specification provides a complete foundation for building a Python-based email service that replicates all the core functionality of your Node.js application, excluding PDF signing features. The system will be fully API-driven and ready for Postman testing and future React.js frontend integration.

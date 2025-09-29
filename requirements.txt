@@ -1,0 +1,44 @@
+# Core Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Database
+pyodbc>=5.0.0
+sqlalchemy>=2.0.0
+
+# Email
+aiosmtplib>=3.0.0
+email-validator>=2.0.0
+
+# Background Tasks
+apscheduler>=3.10.0
+redis>=5.0.0
+
+# Security & Encryption
+bcrypt>=4.1.0
+pycryptodome>=3.19.0
+python-jose[cryptography]>=3.3.0
+
+# Configuration & Environment
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+pydantic-settings>=2.1.0
+
+# File Handling
+aiofiles>=23.2.0
+python-multipart>=0.0.6
+
+# Process Management
+psutil>=5.9.0
+
+# Logging & Monitoring
+structlog>=23.2.0
+
+# Password hashing
+passlib[bcrypt]>=1.7.4
+
+# Additional dependencies that might be needed
+starlette>=0.27.0
+anyio>=3.6.0
+httptools>=0.5.0
+python-json-logger>=2.0.0
