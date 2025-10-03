@@ -361,7 +361,12 @@ class EmailService:
                         # Sign the PDF (this will be the password-protected version if applicable)
                         signing_result = self.pdf_signer.sign_pdf_with_certificate(
                             attachment_data,
-                            email_record.dd_signedby
+                            email_record.dd_signedby,
+                            pdf_password=(
+                                email_record.dd_encpassword.strip()
+                                if email_record.dd_encpassword and email_record.dd_encpassword.strip()
+                                else None
+                            ),
                         )
 
                         if signing_result["success"]:
@@ -405,7 +410,18 @@ class EmailService:
             print(f"TO: {email_record.dd_to_emailid}")
             print(f"CC: {email_record.dd_cc_emailid or 'None'}")
             print(f"Total Recipients: {recipients}")
-            await smtp.send_message(message, recipients=recipients)
+            send_errors, server_response = await smtp.send_message(message, recipients=recipients)
+
+            if send_errors:
+                error_messages = "; ".join(
+                    f"{recipient}: {resp.code} {resp.message}"
+                    for recipient, resp in send_errors.items()
+                )
+                print(f"SMTP rejected recipient(s): {error_messages}")
+                raise Exception(f"SMTP rejected recipient(s): {error_messages}")
+
+            if server_response:
+                print(f"SMTP response: {server_response}")
 
             # Increment counter but don't close connection (persistent)
             self.emails_sent_count += 1
@@ -491,7 +507,21 @@ class EmailService:
             message["Message-ID"] = f"<{message_id}@{smtp_config.smtp_server}>"
 
             print("Sending test email via persistent connection...")
-            await smtp.send_message(message, recipients=[to_email])
+            send_errors, server_response = await smtp.send_message(
+                message,
+                recipients=[to_email],
+            )
+
+            if send_errors:
+                error_messages = "; ".join(
+                    f"{recipient}: {resp.code} {resp.message}"
+                    for recipient, resp in send_errors.items()
+                )
+                print(f"SMTP rejected recipient(s): {error_messages}")
+                raise Exception(f"SMTP rejected recipient(s): {error_messages}")
+
+            if server_response:
+                print(f"SMTP response: {server_response}")
 
             # Increment counter
             self.emails_sent_count += 1
