@@ -307,6 +307,7 @@ class EmailService:
 
             # Track if a new protected PDF was created
             new_protected_pdf = None
+            signing_info_saved = False
 
             # Add attachment if exists
             if email_record.dd_document and email_record.dd_filename:
@@ -351,44 +352,56 @@ class EmailService:
                     print(f"No password protection needed for email ID {email_record.dd_srno}")
 
                 # Check if PDF digital signing is needed
-                if (email_record.dd_signedby and
-                    email_record.dd_signedby.strip() and
-                    PDFPasswordProtector.is_pdf_data(attachment_data)):
+                signing_flag_enabled = (email_record.dd_signed_flag or "").strip().upper() == "Y"
+                signer_name = (email_record.dd_signedby or "").strip()
 
-                    print(f"PDF digital signing required for email ID {email_record.dd_srno} by {email_record.dd_signedby}")
+                if signing_flag_enabled:
+                    if not PDFPasswordProtector.is_pdf_data(attachment_data):
+                        print(f"Signing flag enabled for email ID {email_record.dd_srno} but attachment is not a PDF; skipping digital signature.")
+                    elif not signer_name:
+                        print(f"Signing flag enabled for email ID {email_record.dd_srno} but signer name is missing; skipping digital signature.")
+                    else:
+                        print(f"PDF digital signing required for email ID {email_record.dd_srno} by {signer_name}")
+                        try:
+                            signing_result = self.pdf_signer.sign_pdf_with_certificate(
+                                attachment_data,
+                                signer_name,
+                                pdf_password=(
+                                    email_record.dd_encpassword.strip()
+                                    if email_record.dd_encpassword and email_record.dd_encpassword.strip()
+                                    else None
+                                ),
+                            )
 
-                    try:
-                        # Sign the PDF (this will be the password-protected version if applicable)
-                        signing_result = self.pdf_signer.sign_pdf_with_certificate(
-                            attachment_data,
-                            email_record.dd_signedby,
-                            pdf_password=(
-                                email_record.dd_encpassword.strip()
-                                if email_record.dd_encpassword and email_record.dd_encpassword.strip()
-                                else None
-                            ),
-                        )
+                            if signing_result["success"]:
+                                if signing_result.get("signed_pdf"):
+                                    attachment_data = signing_result["signed_pdf"]
+                                    print("PDF successfully digitally signed")
 
-                        if signing_result["success"]:
-                            if signing_result.get("signed_pdf"):
-                                attachment_data = signing_result["signed_pdf"]
-                                print("PDF successfully digitally signed")
+                                    email_record.dd_signedby = signer_name
+                                    email_record.dd_signedon = signing_result["signed_on"]
+                                    email_record.dd_signedtm = signing_result["signed_time"]
 
-                                # Update the email record with signing information
-                                # (This will be saved to database after successful email sending)
-                                email_record.dd_signedon = signing_result["signed_on"]
-                                email_record.dd_signedtm = signing_result["signed_time"]
+                                    try:
+                                        await self.save_signing_info(
+                                            email_record.dd_srno,
+                                            signer_name,
+                                            email_record.dd_signedon,
+                                            email_record.dd_signedtm,
+                                        )
+                                        signing_info_saved = True
+                                    except Exception as signing_save_error:
+                                        print(f"Warning: Signed PDF but failed to save signing information: {signing_save_error}")
+                                else:
+                                    print("PDF signing completed but no signed data returned")
                             else:
-                                print("PDF signing completed but no signed data returned")
-                        else:
-                            print(f"PDF signing failed: {signing_result.get('error', 'Unknown error')}")
+                                print(f"PDF signing failed: {signing_result.get('error', 'Unknown error')}")
+                                print("Proceeding with unsigned PDF")
+                        except Exception as signing_error:
+                            print(f"Error during PDF signing: {signing_error}")
                             print("Proceeding with unsigned PDF")
-
-                    except Exception as signing_error:
-                        print(f"Error during PDF signing: {signing_error}")
-                        print("Proceeding with unsigned PDF")
                 else:
-                    print(f"No digital signing needed for email ID {email_record.dd_srno}")
+                    print(f"Digital signing not required for email ID {email_record.dd_srno} (flag: {email_record.dd_signed_flag or 'N'})")
 
                 attachment = MIMEApplication(attachment_data, Name=filename)
                 attachment['Content-Disposition'] = f'attachment; filename="{filename}"'
@@ -435,9 +448,11 @@ class EmailService:
                     print(f"Warning: Email sent successfully but failed to save protected PDF: {pdf_save_error}")
 
             # If PDF signing information was updated, save it to the database
-            if (email_record.dd_signedby and
+            if ((email_record.dd_signed_flag or "").strip().upper() == "Y" and
+                email_record.dd_signedby and
                 email_record.dd_signedon and
-                email_record.dd_signedtm):
+                email_record.dd_signedtm and
+                not signing_info_saved):
                 try:
                     await self.save_signing_info(
                         email_record.dd_srno,
@@ -574,7 +589,7 @@ class EmailService:
                 query = text(f"""
                     SELECT TOP {safe_limit} dd_srno, dd_document, dd_filename, dd_toEmailid, dd_ccEmailid,
                            dd_subject, dd_bodyText, dd_SendFlag, dd_EmailParamCode, dd_RetryCount,
-                           dd_Encpassword, dd_Finaldocument, dd_signedby, dd_signedon, dd_signedtm
+                           dd_Encpassword, dd_Finaldocument, dd_signedFlag, dd_signedby, dd_signedon, dd_signedtm
                     FROM Digital_Emaildetails
                     {where_clause}
                     ORDER BY dd_srno
@@ -601,6 +616,7 @@ class EmailService:
                         dd_retry_count=row.dd_RetryCount,
                         dd_encpassword=row.dd_Encpassword,
                         dd_finaldocument=row.dd_Finaldocument,
+                        dd_signed_flag=row.dd_signedFlag,
                         dd_signedby=row.dd_signedby,
                         dd_signedon=row.dd_signedon,
                         dd_signedtm=row.dd_signedtm
@@ -805,3 +821,4 @@ class EmailService:
 
 # Global email service instance
 email_service = EmailService()
+

@@ -50,6 +50,7 @@ class EmailRecord(BaseModel):
     dd_last_retry_date: Optional[datetime] = None
     dd_encpassword: Optional[str] = None  # Password for PDF encryption
     dd_finaldocument: Optional[bytes] = None  # Password-protected PDF
+    dd_signed_flag: Optional[str] = None  # Database flag indicating whether signing is required
     dd_signedby: Optional[str] = None  # Name of person who signed the document
     dd_signedon: Optional[str] = None  # Date when document was signed (as string from DB)
     dd_signedtm: Optional[str] = None  # Time when document was signed (as string from DB)
