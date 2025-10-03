@@ -115,7 +115,8 @@ def install_dependencies(python_exe):
             "apscheduler>=3.10.0",
             "pypdf>=4.0.0",
             "endesive>=2.19.0",
-            "PyKCS11>=1.5.18"
+            "PyKCS11>=1.5.18",
+            "reportlab>=4.0.0"
         ]
 
         failed_deps = []

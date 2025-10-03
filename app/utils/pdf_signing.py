@@ -268,6 +268,10 @@ class PDFSigner:
             from Cryptodome.Cipher import AES  # noqa: F401
         except ImportError:
             missing_packages.append('pycryptodomex')
+        try:
+            from reportlab.pdfgen import canvas  # noqa: F401
+        except ImportError:
+            missing_packages.append('reportlab')
 
         if missing_packages:
             print('[ERROR] Missing required packages for PDF signing: ' + ', '.join(missing_packages))
@@ -277,13 +281,13 @@ class PDFSigner:
         self._packages_installed = True
         return True
 
-
     def _prepare_pdf_for_signing(
         self,
         pdf_data: bytes,
         pdf_password: Optional[str],
+        signer_name: str,
     ) -> Tuple[bytes, bool]:
-        'Prepare PDF bytes for signing, validating passwords and normalising encryption.'
+        """Prepare PDF bytes, enforcing password rules and appending visible footer."""
         try:
             from pypdf import PdfReader, PdfWriter
         except ImportError as exc:
@@ -295,9 +299,9 @@ class PDFSigner:
         except Exception as exc:
             raise ValueError(f'Unable to read PDF bytes: {exc}') from exc
 
-        converted_to_rc4 = False
-
-        if reader.is_encrypted:
+        was_encrypted = reader.is_encrypted
+        encryption_version = 0
+        if was_encrypted:
             if not pdf_password:
                 raise ValueError('PDF is password protected but no password was provided.')
             try:
@@ -316,34 +320,90 @@ class PDFSigner:
             else:
                 encrypt_dict = encrypt_ref
 
-            version = 0
             if isinstance(encrypt_dict, dict):
                 try:
-                    version = int(encrypt_dict.get('/V', 0))
+                    encryption_version = int(encrypt_dict.get('/V', 0))
                 except Exception:
-                    version = 0
-
-            if version not in (0, 1, 2):
-                print(f"[WARN] Encryption algorithm V={version} unsupported for direct signing; re-encrypting with 128-bit RC4...")
-                writer = PdfWriter()
-                for page in reader.pages:
-                    writer.add_page(page)
-                if reader.metadata:
-                    writer.add_metadata(reader.metadata)
-                writer.encrypt(
-                    user_password=pdf_password,
-                    owner_password=pdf_password,
-                    use_128bit=True,
-                )
-                buffer_out = io.BytesIO()
-                writer.write(buffer_out)
-                pdf_data = buffer_out.getvalue()
-                converted_to_rc4 = True
-                print('[OK] PDF re-encrypted with RC4 for signing compatibility.')
+                    encryption_version = 0
+            else:
+                encryption_version = 0
         elif pdf_password:
             print('[WARN] Password provided but PDF is not encrypted; continuing without decryption.')
 
-        return pdf_data, converted_to_rc4
+        writer = PdfWriter()
+        page_total = len(reader.pages)
+        for index, page in enumerate(reader.pages):
+            if page_total and index == page_total - 1:
+                try:
+                    overlay_page = self._build_signature_overlay(
+                        float(page.mediabox.width),
+                        float(page.mediabox.height),
+                        signer_name,
+                    )
+                    if overlay_page is not None:
+                        self._merge_page_with_overlay(page, overlay_page)
+                except Exception as overlay_error:
+                    print(f"[WARN] Failed to apply signature text: {overlay_error}")
+            writer.add_page(page)
+
+        if reader.metadata:
+            writer.add_metadata(reader.metadata)
+
+        converted_to_rc4 = False
+        if was_encrypted:
+            if encryption_version not in (0, 1, 2):
+                print('[WARN] Encryption algorithm unsupported for direct signing; re-encrypting with 128-bit RC4.')
+                converted_to_rc4 = True
+            writer.encrypt(
+                user_password=pdf_password,
+                owner_password=pdf_password,
+                use_128bit=True,
+            )
+
+        buffer_out = io.BytesIO()
+        writer.write(buffer_out)
+        stamped_pdf_data = buffer_out.getvalue()
+
+        return stamped_pdf_data, converted_to_rc4
+
+    def _merge_page_with_overlay(self, page, overlay_page) -> None:
+        """Safely merge overlay content onto an existing PDF page."""
+        merge_callable = getattr(page, 'merge_page', None)
+        if merge_callable is None:
+            merge_callable = getattr(page, 'mergePage', None)
+        if merge_callable is None:
+            raise AttributeError('PdfPageObject is missing merge_page/mergePage methods')
+        merge_callable(overlay_page)
+
+    def _build_signature_overlay(
+        self,
+        page_width: float,
+        page_height: float,
+        signer_name: str,
+    ):
+        """Generate a PDF page containing the visible signature footer text."""
+        text = f"Digitally signed by {signer_name}"
+        try:
+            from reportlab.pdfgen import canvas
+        except ImportError as exc:
+            raise RuntimeError('reportlab is required to render signature text onto PDFs') from exc
+
+        packet = io.BytesIO()
+        canvas_obj = canvas.Canvas(packet, pagesize=(page_width, page_height))
+        font_size = 10
+        margin_x = 18
+        margin_y = 18
+        canvas_obj.setFont('Helvetica', font_size)
+        canvas_obj.drawRightString(page_width - margin_x, margin_y, text)
+        canvas_obj.save()
+        packet.seek(0)
+
+        from pypdf import PdfReader
+
+        overlay_reader = PdfReader(packet)
+        if not overlay_reader.pages:
+            return None
+        return overlay_reader.pages[0]
 
     def sign_pdf_with_certificate(
         self,
@@ -395,7 +455,7 @@ class PDFSigner:
                 pkcs12 = None
 
             try:
-                prepared_pdf_data, converted_to_rc4 = self._prepare_pdf_for_signing(pdf_data, pdf_password)
+                prepared_pdf_data, converted_to_rc4 = self._prepare_pdf_for_signing(pdf_data, pdf_password, signer_name)
             except Exception as prep_error:
                 print(f"PDF preparation failed: {prep_error}")
                 return {
@@ -639,7 +699,7 @@ class PDFSigner:
                 }
 
             try:
-                prepared_pdf_data, converted_to_rc4 = self._prepare_pdf_for_signing(pdf_data, pdf_password)
+                prepared_pdf_data, converted_to_rc4 = self._prepare_pdf_for_signing(pdf_data, pdf_password, signer_name)
             except Exception as prep_error:
                 print(f"PDF preparation failed: {prep_error}")
                 return {
@@ -753,3 +813,4 @@ class PDFSigner:
                 "size_bytes": len(pdf_data),
                 "error": str(e)
             }
+
