@@ -14,7 +14,29 @@ DEFAULT_CERTIFICATE_PATH = "signing_certificate.p12"  # Add your certificate pat
 DEFAULT_CERTIFICATE_PASSWORD = "certificate_password"  # Add your certificate password
 
 # Hardware token defaults
-DEFAULT_PKCS11_LIBRARY = os.environ.get("PDF_SIGNER_PKCS11_LIB", r"C:\\\Windows\\System32\\eTPKCS11.dll")
+# Use environment variable or try to find the library dynamically
+def _get_default_pkcs11_library():
+    """Get default PKCS11 library path based on OS"""
+    if os.environ.get("PDF_SIGNER_PKCS11_LIB"):
+        return os.environ.get("PDF_SIGNER_PKCS11_LIB")
+
+    # Try common paths for Windows
+    if os.name == 'nt':  # Windows
+        possible_paths = [
+            os.path.join(os.environ.get('SYSTEMROOT', 'C:\\Windows'), 'System32', 'eTPKCS11.dll'),
+            os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'System32', 'eTPKCS11.dll'),
+            r"C:\Windows\System32\eTPKCS11.dll",
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        # Return first option as default even if not found
+        return possible_paths[0]
+
+    # For Linux/Mac, return a generic path
+    return "/usr/lib/libeTPkcs11.so"
+
+DEFAULT_PKCS11_LIBRARY = _get_default_pkcs11_library()
 DEFAULT_TOKEN_LABEL_HINTS = ["Secmark", "Card", "A33F79EEA4260E4B"]
 
 class SafeNetTokenSigner:
@@ -28,6 +50,8 @@ class SafeNetTokenSigner:
         self.pkcs11 = None
         self.session = None
         self._cached_certificate = None
+        self.token_label = None
+        self.slot_id = None
 
     def __enter__(self):
         return self
@@ -52,6 +76,8 @@ class SafeNetTokenSigner:
         finally:
             self.pkcs11 = None
             self._cached_certificate = None
+            self.slot_id = None
+            self.token_label = None
 
     def login(self):
         try:
@@ -92,6 +118,8 @@ class SafeNetTokenSigner:
                 target_slot, PK11.CKF_SERIAL_SESSION | PK11.CKF_RW_SESSION
             )
             self.session.login(self.pin)
+            self.slot_id = target_slot
+            self.token_label = target_label
             print(f"[OK] Successfully logged into SafeNet token '{target_label}'")
 
         except Exception as error:
@@ -280,6 +308,68 @@ class PDFSigner:
 
         self._packages_installed = True
         return True
+
+    def get_hardware_token_status(self) -> Dict[str, Any]:
+        """Check hardware token availability and certificate presence."""
+        status: Dict[str, Any] = {
+            "library_path": self.pkcs11_library_path,
+            "token_present": False,
+            "certificate_found": False,
+            "token_label": None,
+            "slot_id": None,
+            "available": False,
+            "error": None,
+        }
+
+        try:
+            import PyKCS11  # noqa: F401
+        except ImportError as exc:
+            status["error"] = f"PyKCS11 import error: {exc}"
+            return status
+
+        try:
+            with SafeNetTokenSigner(
+                self.token_pin,
+                self.pkcs11_library_path,
+                self.token_label_hints,
+            ) as token_signer:
+                token_signer.login()
+                status["token_present"] = True
+                status["token_label"] = token_signer.token_label
+                status["slot_id"] = token_signer.slot_id
+
+                try:
+                    certificate_tuple = token_signer.certificate()
+                except Exception as certificate_error:
+                    status["error"] = str(certificate_error)
+                else:
+                    if certificate_tuple:
+                        cert_id, cert_der = certificate_tuple
+                        if cert_id:
+                            try:
+                                status["certificate_id"] = cert_id.hex() if isinstance(cert_id, (bytes, bytearray)) else str(cert_id)
+                            except Exception:
+                                status["certificate_id"] = None
+                        if cert_der:
+                            status["certificate_found"] = True
+                            try:
+                                from cryptography import x509  # type: ignore
+                                cert_obj = x509.load_der_x509_certificate(cert_der)
+                                status["certificate_subject"] = cert_obj.subject.rfc4514_string()
+                                status["certificate_not_valid_before"] = cert_obj.not_valid_before.isoformat()
+                                status["certificate_not_valid_after"] = cert_obj.not_valid_after.isoformat()
+                            except Exception:
+                                pass
+        except Exception as error:
+            status["error"] = str(error)
+
+        status["available"] = bool(status.get("token_present") and status.get("certificate_found") and not status.get("error"))
+        return status
+
+    def is_hardware_token_ready(self) -> bool:
+        """Return True when a hardware token with a certificate is available."""
+        status = self.get_hardware_token_status()
+        return bool(status.get("available"))
 
     def _prepare_pdf_for_signing(
         self,

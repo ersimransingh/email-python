@@ -125,6 +125,7 @@ class EmailWorker:
                 "processed": stats.processed,
                 "success": stats.success,
                 "failed": stats.failed,
+                "skipped": stats.skipped,
                 "timestamp": datetime.now()
             }
 
@@ -205,7 +206,7 @@ class EmailWorker:
             # Process the email queue
             stats = await email_service.process_email_queue()
 
-            print(f"Email processing completed: {stats.processed} processed, {stats.success} sent, {stats.failed} failed")
+            print(f"Email processing completed: {stats.processed} processed, {stats.success} sent, {stats.failed} failed, {stats.skipped} skipped")
 
         except Exception as e:
             print(f"Error in scheduled email processing: {e}")

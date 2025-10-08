@@ -62,12 +62,14 @@ class EmailResult(BaseModel):
     recipient: str
     cc: Optional[str] = None
     error: Optional[str] = None
+    retry_later: bool = False
 
 
 class ProcessingStats(BaseModel):
     processed: int
     success: int
     failed: int
+    skipped: int = 0
 
 
 class WorkerStatus(BaseModel):

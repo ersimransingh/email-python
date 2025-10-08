@@ -4,7 +4,7 @@ from datetime import datetime
 from app.core.config import EmailConfig
 from app.models.email import (
     EmailTestRequest, EmailTestResponse,
-    EmailProcessResponse, DashboardResponse
+    EmailProcessResponse, DashboardResponse, CertificateStatusResponse
 )
 from app.services.email_service import email_service
 from app.services.email_worker import email_worker
@@ -47,6 +47,35 @@ async def check_email_config(current_user: dict = Depends(get_current_user)):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error checking email configuration: {str(e)}"
+        )
+
+
+@router.get("/certificate-status", response_model=CertificateStatusResponse)
+async def get_certificate_status(current_user: dict = Depends(get_current_user)):
+    """Check status of USB hardware certificate token."""
+    try:
+        status_data = await email_service.get_hardware_certificate_status()
+        available = bool(status_data.get("available"))
+
+        return CertificateStatusResponse(
+            success=available,
+            available=available,
+            token_present=bool(status_data.get("token_present")),
+            certificate_found=bool(status_data.get("certificate_found")),
+            token_label=status_data.get("token_label"),
+            slot_id=status_data.get("slot_id"),
+            certificate_id=status_data.get("certificate_id"),
+            certificate_subject=status_data.get("certificate_subject"),
+            certificate_not_valid_before=status_data.get("certificate_not_valid_before"),
+            certificate_not_valid_after=status_data.get("certificate_not_valid_after"),
+            library_path=status_data.get("library_path"),
+            error=status_data.get("error"),
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error checking certificate status: {str(e)}"
         )
 
 
@@ -93,7 +122,8 @@ async def force_process_emails(current_user: dict = Depends(get_current_user)):
             timestamp=result.get("timestamp", datetime.now()),
             processed=result.get("processed"),
             sent=result.get("success"),
-            failed=result.get("failed")
+            failed=result.get("failed"),
+            skipped=result.get("skipped")
         )
 
     except Exception as e:

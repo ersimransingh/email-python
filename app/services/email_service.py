@@ -28,6 +28,22 @@ class EmailService:
         self.emails_sent_count = 0
         self.pdf_signer = PDFSigner()  # Initialize PDF signer
 
+    async def get_hardware_certificate_status(self) -> Dict[str, Any]:
+        """Return current status of the USB hardware certificate token."""
+        try:
+            return self.pdf_signer.get_hardware_token_status()
+        except Exception as error:
+            print(f"Error retrieving hardware token status: {error}")
+            return {
+                "library_path": getattr(self.pdf_signer, "pkcs11_library_path", None),
+                "token_present": False,
+                "certificate_found": False,
+                "token_label": None,
+                "slot_id": None,
+                "available": False,
+                "error": str(error),
+            }
+
     async def get_smtp_details(self) -> Optional[SMTPConfig]:
         """Get default SMTP configuration from database"""
         try:
@@ -362,6 +378,24 @@ class EmailService:
                         print(f"Signing flag enabled for email ID {email_record.dd_srno} but signer name is missing; skipping digital signature.")
                     else:
                         print(f"PDF digital signing required for email ID {email_record.dd_srno} by {signer_name}")
+                        token_status = await self.get_hardware_certificate_status()
+                        if not token_status.get("available"):
+                            default_reason = ("Hardware token not detected"
+                                               if not token_status.get("token_present")
+                                               else "Certificate not found on hardware token")
+                            reason = token_status.get("error") or default_reason
+                            token_label = token_status.get("token_label") or "unknown"
+                            print(
+                                f"Digital signing postponed for email ID {email_record.dd_srno}: {reason} "
+                                f"(token label: {token_label})"
+                            )
+                            return EmailResult(
+                                success=False,
+                                recipient=email_record.dd_to_emailid,
+                                cc=email_record.dd_cc_emailid,
+                                error=f"Digital signing postponed: {reason}",
+                                retry_later=True
+                            )
                         try:
                             signing_result = self.pdf_signer.sign_pdf_with_certificate(
                                 attachment_data,
@@ -747,13 +781,21 @@ class EmailService:
 
         try:
             pending_emails = await self.get_pending_emails(include_high_retry=include_high_retry)
-            stats.processed = len(pending_emails)
+            total_emails = len(pending_emails)
 
-            print(f"\nProcessing {len(pending_emails)} pending emails using persistent SMTP connection...")
+            print(f"\nProcessing {total_emails} pending emails using persistent SMTP connection...")
 
-            for i, email_record in enumerate(pending_emails):
-                print(f"\n[{i+1}/{len(pending_emails)}] Processing email ID {email_record.dd_srno}")
+            for index, email_record in enumerate(pending_emails):
+                print(f"\n[{index + 1}/{total_emails}] Processing email ID {email_record.dd_srno}")
                 result = await self.send_email_with_attachment(email_record)
+
+                if getattr(result, "retry_later", False):
+                    stats.skipped += 1
+                    reason = result.error or "Deferred for retry"
+                    print(f"SKIPPED: Email {email_record.dd_srno} deferred: {reason}")
+                    continue
+
+                stats.processed += 1
 
                 if result.success:
                     await self.update_email_status(email_record.dd_srno, "Y", result.message_id)
@@ -764,17 +806,17 @@ class EmailService:
                     stats.failed += 1
                     print(f"FAILED: Email {email_record.dd_srno} failed: {result.error}")
 
-                # Reduced delay since we're using persistent connection
-                if i < len(pending_emails) - 1:  # Don't delay after last email
-                    await asyncio.sleep(0.5)  # Reduced from 1 second to 0.5 seconds
+                if index < total_emails - 1:
+                    await asyncio.sleep(0.5)
 
-            # Close connection after processing all emails
             await self._close_smtp_connection()
-            print(f"\nEmail queue processing completed. Connection closed.")
+            print(
+                f"\nEmail queue processing completed. Connection closed. Processed: {stats.processed}, "
+                f"Sent: {stats.success}, Failed: {stats.failed}, Skipped: {stats.skipped}"
+            )
 
         except Exception as e:
             print(f"Error processing email queue: {e}")
-            # Ensure connection is closed on error
             await self._close_smtp_connection()
 
         return stats

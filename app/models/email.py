@@ -22,6 +22,22 @@ class EmailProcessResponse(BaseModel):
     processed: Optional[int] = None
     sent: Optional[int] = None
     failed: Optional[int] = None
+    skipped: Optional[int] = None
+
+
+class CertificateStatusResponse(BaseModel):
+    success: bool
+    available: bool
+    token_present: bool
+    certificate_found: bool
+    token_label: Optional[str] = None
+    slot_id: Optional[int] = None
+    certificate_id: Optional[str] = None
+    certificate_subject: Optional[str] = None
+    certificate_not_valid_before: Optional[str] = None
+    certificate_not_valid_after: Optional[str] = None
+    library_path: Optional[str] = None
+    error: Optional[str] = None
 
 
 class ServiceControlRequest(BaseModel):

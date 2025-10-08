@@ -12,7 +12,8 @@
       "Bash(docker-compose:*)",
       "Bash(curl:*)",
       "Bash(telnet:*)",
-      "Bash(powershell:*)"
+      "Bash(powershell:*)",
+      "Bash(where python)"
     ],
     "deny": [],
     "ask": []

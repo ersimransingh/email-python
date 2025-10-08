@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Enhanced Email Service API Starter
 Automatically sets up Python 3.11 environment and installs all dependencies
@@ -10,6 +11,15 @@ import os
 import venv
 import platform
 from pathlib import Path
+
+# Set UTF-8 encoding for Windows console
+if platform.system() == "Windows":
+    try:
+        import codecs
+        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+        sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
+    except Exception:
+        pass  # If it fails, continue without UTF-8
 
 # Configuration
 REQUIRED_PYTHON_VERSION = (3, 11)
@@ -78,6 +88,20 @@ def get_venv_python(venv_path):
         return venv_path / "Scripts" / "python.exe"
     else:
         return venv_path / "bin" / "python"
+
+def verify_venv_python(venv_python):
+    """Verify that the virtual environment Python is working"""
+    try:
+        result = subprocess.run(
+            [str(venv_python), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(f"Venv Python verification failed: {e}")
+        return False
 
 def install_dependencies(python_exe):
     """Install all project dependencies"""
@@ -199,9 +223,30 @@ def main():
 
     # Step 3: Get virtual environment Python
     venv_python = get_venv_python(venv_path)
-    if not venv_python.exists():
-        print(f"✗ Virtual environment Python not found: {venv_python}")
-        sys.exit(1)
+
+    # Check if venv Python exists and works
+    if not venv_python.exists() or not verify_venv_python(venv_python):
+        print(f"✗ Virtual environment is corrupted or invalid")
+        print(f"Removing corrupted venv and recreating...")
+
+        # Remove corrupted venv
+        import shutil
+        try:
+            shutil.rmtree(venv_path)
+            print("✓ Removed corrupted virtual environment")
+        except Exception as e:
+            print(f"Warning: Could not remove venv directory: {e}")
+
+        # Recreate venv
+        venv_path = create_virtual_environment(python_cmd)
+        if not venv_path:
+            print("✗ Failed to recreate virtual environment")
+            sys.exit(1)
+
+        venv_python = get_venv_python(venv_path)
+        if not venv_python.exists():
+            print(f"✗ Virtual environment Python not found after recreation: {venv_python}")
+            sys.exit(1)
 
     print(f"✓ Using Python: {venv_python}")
 
