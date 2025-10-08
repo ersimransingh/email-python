@@ -386,14 +386,16 @@ class EmailService:
                             reason = token_status.get("error") or default_reason
                             token_label = token_status.get("token_label") or "unknown"
                             print(
-                                f"Digital signing postponed for email ID {email_record.dd_srno}: {reason} "
-                                f"(token label: {token_label})"
+                                f"Digital signing required but certificate unavailable for email ID {email_record.dd_srno}: {reason} "
+                                f"(token label: {token_label}). Skipping this email - it will remain pending."
                             )
+                            # Instead of failing the entire process, just skip this email that requires signing
+                            # Return a skipped result (not an error) so the process continues with other emails
                             return EmailResult(
                                 success=False,
                                 recipient=email_record.dd_to_emailid,
                                 cc=email_record.dd_cc_emailid,
-                                error=f"Digital signing postponed: {reason}",
+                                error=f"Digital signing required but certificate unavailable: {reason}. Email skipped - will retry when certificate is available.",
                                 retry_later=True
                             )
                         try:
@@ -435,7 +437,7 @@ class EmailService:
                             print(f"Error during PDF signing: {signing_error}")
                             print("Proceeding with unsigned PDF")
                 else:
-                    print(f"Digital signing not required for email ID {email_record.dd_srno} (flag: {email_record.dd_signed_flag or 'N'})")
+                    print(f"Digital signing not required for email ID {email_record.dd_srno} (dd_signed_flag: {email_record.dd_signed_flag or 'N'}) - proceeding with email sending")
 
                 attachment = MIMEApplication(attachment_data, Name=filename)
                 attachment['Content-Disposition'] = f'attachment; filename="{filename}"'
@@ -636,6 +638,9 @@ class EmailService:
                 print(f"Found {len(rows)} pending email(s)")
 
                 emails = []
+                emails_requiring_signing = 0
+                emails_not_requiring_signing = 0
+                
                 for row in rows:
                     email_record = EmailRecord(
                         dd_srno=row.dd_srno,
@@ -656,7 +661,18 @@ class EmailService:
                         dd_signedtm=row.dd_signedtm
                     )
                     emails.append(email_record)
-                    print(f"  - Email ID {row.dd_srno}: {row.dd_toEmailid} (Retry: {row.dd_RetryCount})")
+                    
+                    # Count signing requirements
+                    if (row.dd_signedFlag or "").strip().upper() == "Y":
+                        emails_requiring_signing += 1
+                    else:
+                        emails_not_requiring_signing += 1
+                        
+                    print(f"  - Email ID {row.dd_srno}: {row.dd_toEmailid} (Retry: {row.dd_RetryCount}, Signing: {(row.dd_signedFlag or 'N').upper()})")
+
+                # Print summary of signing requirements
+                if emails_requiring_signing > 0 or emails_not_requiring_signing > 0:
+                    print(f"Email signing summary: {emails_requiring_signing} emails require digital signing, {emails_not_requiring_signing} emails can be sent without signing")
 
                 return emails
         except Exception as e:
@@ -784,6 +800,21 @@ class EmailService:
             total_emails = len(pending_emails)
 
             print(f"\nProcessing {total_emails} pending emails using persistent SMTP connection...")
+            
+            # Check certificate status upfront to inform about signing capabilities
+            try:
+                cert_status = await self.get_hardware_certificate_status()
+                cert_available = cert_status.get("available", False)
+                if cert_available:
+                    print(f"✓ Digital certificate is available - emails requiring signing will be processed normally")
+                else:
+                    cert_error = cert_status.get("error", "Certificate not found")
+                    print(f"⚠ Digital certificate is not available ({cert_error})")
+                    print(f"  - Emails with dd_signed_flag='Y' will be skipped and remain pending")
+                    print(f"  - Emails with dd_signed_flag='N' will be sent without signing")
+            except Exception as cert_check_error:
+                print(f"⚠ Could not check certificate status: {cert_check_error}")
+                print(f"  - Emails requiring signing may fail during processing")
 
             for index, email_record in enumerate(pending_emails):
                 print(f"\n[{index + 1}/{total_emails}] Processing email ID {email_record.dd_srno}")
