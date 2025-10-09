@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 
@@ -71,3 +71,26 @@ class DashboardResponse(BaseModel):
     database: Dict[str, Any]
     schedule: Dict[str, Any]
     service: Dict[str, Any]
+
+
+class CertificateInfo(BaseModel):
+    subject: str
+    issuer: str
+    serial_number: str
+    not_valid_before: str
+    not_valid_after: str
+    thumbprint: str
+    has_private_key: bool
+    store_name: Optional[str] = None
+    store_location: Optional[str] = None
+    source: str  # "System Store" or "Hardware Token"
+    token_label: Optional[str] = None
+    slot_id: Optional[int] = None
+
+
+class AllCertificatesResponse(BaseModel):
+    success: bool
+    total_certificates: int
+    system_certificates: List[CertificateInfo]
+    hardware_certificates: List[CertificateInfo]
+    error: Optional[str] = None

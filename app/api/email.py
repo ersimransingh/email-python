@@ -4,12 +4,14 @@ from datetime import datetime
 from app.core.config import EmailConfig
 from app.models.email import (
     EmailTestRequest, EmailTestResponse,
-    EmailProcessResponse, DashboardResponse, CertificateStatusResponse
+    EmailProcessResponse, DashboardResponse, CertificateStatusResponse,
+    AllCertificatesResponse
 )
 from app.services.email_service import email_service
 from app.services.email_worker import email_worker
 from app.services.database_manager import db_manager
 from app.api.auth import get_current_user
+from app.utils.certificate_utils import get_all_certificates
 
 router = APIRouter()
 
@@ -76,6 +78,40 @@ async def get_certificate_status(current_user: dict = Depends(get_current_user))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error checking certificate status: {str(e)}"
+        )
+
+
+@router.get("/certificates", response_model=AllCertificatesResponse)
+async def list_all_certificates(current_user: dict = Depends(get_current_user)):
+    """
+    List all certificates attached to the computer.
+
+    This endpoint enumerates both:
+    - System certificates from Windows certificate stores (Personal, Root, Intermediate)
+    - Hardware token certificates from USB security tokens
+
+    Returns detailed information about each certificate including:
+    - Subject and issuer
+    - Validity period
+    - Serial number and thumbprint
+    - Whether it has a private key
+    - Source location (system store or hardware token)
+    """
+    try:
+        result = get_all_certificates()
+
+        return AllCertificatesResponse(
+            success=result["success"],
+            total_certificates=result["total_certificates"],
+            system_certificates=result["system_certificates"],
+            hardware_certificates=result["hardware_certificates"],
+            error=result.get("error")
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error listing certificates: {str(e)}"
         )
 
 
