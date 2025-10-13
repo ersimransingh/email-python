@@ -1,11 +1,14 @@
 from fastapi import APIRouter, HTTPException, Depends, status
+from typing import List
 from datetime import datetime
 
 from app.core.config import EmailConfig
 from app.models.email import (
     EmailTestRequest, EmailTestResponse,
     EmailProcessResponse, DashboardResponse, CertificateStatusResponse,
-    AllCertificatesResponse
+    AllCertificatesResponse, CertificatePinSetRequest,
+    CertificatePinSetResponse, CertificatePinStatusResponse,
+    HardwareCertificatePinStatus
 )
 from app.services.email_service import email_service
 from app.services.email_worker import email_worker
@@ -113,6 +116,204 @@ async def list_all_certificates(current_user: dict = Depends(get_current_user)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error listing certificates: {str(e)}"
         )
+
+
+@router.post("/certificates/pins", response_model=CertificatePinSetResponse)
+async def set_certificate_pins(
+    request: CertificatePinSetRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Store or update PINs for hardware token certificates.
+
+    Validates the supplied PIN immediately when the PKCS#11 library is available.
+    """
+    if not request.entries:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one certificate entry is required"
+        )
+
+    pin_manager = getattr(email_service.pdf_signer, "pin_manager", None)
+    if pin_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Certificate PIN manager is not initialised"
+        )
+
+    results = []
+    all_successful = True
+    library_path = email_service.pdf_signer.pkcs11_library_path
+
+    for entry in request.entries:
+        metadata = {
+            "subject": entry.certificate_subject,
+            "serial_number": entry.certificate_serial,
+        }
+        try:
+            stored_entry = pin_manager.set_pin(
+                token_label=entry.token_label,
+                certificate_id=entry.certificate_id,
+                pin=entry.pin,
+                slot_id=entry.slot_id,
+                metadata=metadata,
+                validate=True,
+                pkcs11_library=library_path,
+            )
+            pin_valid = stored_entry.get("pin_valid")
+            if pin_valid is True:
+                message = "PIN stored and validated successfully"
+            elif pin_valid is None:
+                message = stored_entry.get("last_verification_error") or "PIN stored; validation not performed"
+            else:
+                message = "PIN stored"
+
+            results.append({
+                "token_label": entry.token_label,
+                "certificate_id": entry.certificate_id,
+                "slot_id": entry.slot_id,
+                "success": True,
+                "message": message,
+                "pin_valid": pin_valid,
+                "pin_last_verified_at": stored_entry.get("last_verified_at"),
+                "error": None,
+            })
+        except ValueError as validation_error:
+            all_successful = False
+            results.append({
+                "token_label": entry.token_label,
+                "certificate_id": entry.certificate_id,
+                "slot_id": entry.slot_id,
+                "success": False,
+                "message": "Failed to store PIN",
+                "pin_valid": False,
+                "pin_last_verified_at": None,
+                "error": str(validation_error),
+            })
+        except Exception as unexpected_error:
+            all_successful = False
+            results.append({
+                "token_label": entry.token_label,
+                "certificate_id": entry.certificate_id,
+                "slot_id": entry.slot_id,
+                "success": False,
+                "message": "Unexpected error while storing PIN",
+                "pin_valid": None,
+                "pin_last_verified_at": None,
+                "error": str(unexpected_error),
+            })
+
+    return CertificatePinSetResponse(success=all_successful, results=results)
+
+
+@router.get("/certificates/pins/status", response_model=CertificatePinStatusResponse)
+async def get_certificate_pin_status(
+    refresh: bool = False,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Report the configured PIN status for hardware token certificates.
+
+    When `refresh` is true, the API will attempt to re-validate stored PINs
+    against the connected tokens (requires the token to be inserted).
+    """
+    pin_manager = getattr(email_service.pdf_signer, "pin_manager", None)
+    if pin_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Certificate PIN manager is not initialised"
+        )
+
+    library_path = email_service.pdf_signer.pkcs11_library_path
+
+    try:
+        certificates_info = get_all_certificates()
+        hardware_certificates = certificates_info.get("hardware_certificates", [])
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error enumerating certificates: {str(e)}"
+        )
+
+    statuses: List[HardwareCertificatePinStatus] = []
+    seen_entries = set()
+
+    for cert in hardware_certificates:
+        token_label = cert.get("token_label")
+        certificate_id = cert.get("thumbprint")
+        slot_id = cert.get("slot_id")
+
+        entry = pin_manager.get_entry(token_label, certificate_id) if token_label else None
+        if not entry and token_label:
+            entry = pin_manager.get_entry(token_label)
+
+        if entry and entry.get("pin") and (refresh or entry.get("pin_valid") is None):
+            validation_status, validation_error = pin_manager.validate_pin(
+                token_label=token_label,
+                slot_id=slot_id,
+                pin=entry.get("pin"),
+                pkcs11_library=library_path,
+            )
+            pin_manager.record_validation(token_label, certificate_id, validation_status, validation_error)
+            entry = pin_manager.get_entry(token_label, certificate_id) if token_label else None
+            if not entry and token_label:
+                entry = pin_manager.get_entry(token_label)
+
+        pin_configured = bool(entry)
+        statuses.append(
+            HardwareCertificatePinStatus(
+                token_present=True,
+                token_label=token_label,
+                slot_id=slot_id,
+                certificate_id=certificate_id,
+                subject=cert.get("subject"),
+                issuer=cert.get("issuer"),
+                serial_number=cert.get("serial_number"),
+                not_valid_before=cert.get("not_valid_before"),
+                not_valid_after=cert.get("not_valid_after"),
+                pin_configured=pin_configured,
+                pin_valid=entry.get("pin_valid") if entry else None,
+                pin_last_verified_at=entry.get("last_verified_at") if entry else None,
+                pin_last_error=entry.get("last_verification_error") if entry else None,
+            )
+        )
+
+        if token_label:
+            seen_key = f"{token_label}::{certificate_id or ''}".lower()
+            seen_entries.add(seen_key)
+
+    for stored_entry in pin_manager.list_entries():
+        token_label = stored_entry.get("token_label")
+        certificate_id = stored_entry.get("certificate_id")
+        seen_key = f"{token_label}::{certificate_id or ''}".lower()
+        if seen_key in seen_entries:
+            continue
+
+        metadata = stored_entry.get("metadata") or {}
+        statuses.append(
+            HardwareCertificatePinStatus(
+                token_present=False,
+                token_label=token_label,
+                slot_id=stored_entry.get("slot_id"),
+                certificate_id=certificate_id,
+                subject=metadata.get("subject"),
+                issuer=metadata.get("issuer"),
+                serial_number=metadata.get("serial_number") or metadata.get("certificate_serial"),
+                not_valid_before=metadata.get("not_valid_before"),
+                not_valid_after=metadata.get("not_valid_after"),
+                pin_configured=True,
+                pin_valid=stored_entry.get("pin_valid"),
+                pin_last_verified_at=stored_entry.get("last_verified_at"),
+                pin_last_error=stored_entry.get("last_verification_error"),
+            )
+        )
+
+    return CertificatePinStatusResponse(
+        success=True,
+        total_certificates=len(statuses),
+        certificates=statuses,
+        error=None
+    )
 
 
 @router.post("/email-test", response_model=EmailTestResponse)

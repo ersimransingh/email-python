@@ -94,3 +94,55 @@ class AllCertificatesResponse(BaseModel):
     system_certificates: List[CertificateInfo]
     hardware_certificates: List[CertificateInfo]
     error: Optional[str] = None
+
+
+class CertificatePinPayload(BaseModel):
+    token_label: str
+    certificate_id: Optional[str] = None
+    slot_id: Optional[int] = None
+    pin: str
+    certificate_subject: Optional[str] = None
+    certificate_serial: Optional[str] = None
+
+
+class CertificatePinOperationResult(BaseModel):
+    token_label: str
+    certificate_id: Optional[str] = None
+    slot_id: Optional[int] = None
+    success: bool
+    message: str
+    pin_valid: Optional[bool] = None
+    pin_last_verified_at: Optional[str] = None
+    error: Optional[str] = None
+
+
+class CertificatePinSetRequest(BaseModel):
+    entries: List[CertificatePinPayload]
+
+
+class CertificatePinSetResponse(BaseModel):
+    success: bool
+    results: List[CertificatePinOperationResult]
+
+
+class HardwareCertificatePinStatus(BaseModel):
+    token_present: bool
+    token_label: Optional[str] = None
+    slot_id: Optional[int] = None
+    certificate_id: Optional[str] = None
+    subject: Optional[str] = None
+    issuer: Optional[str] = None
+    serial_number: Optional[str] = None
+    not_valid_before: Optional[str] = None
+    not_valid_after: Optional[str] = None
+    pin_configured: bool
+    pin_valid: Optional[bool] = None
+    pin_last_verified_at: Optional[str] = None
+    pin_last_error: Optional[str] = None
+
+
+class CertificatePinStatusResponse(BaseModel):
+    success: bool
+    total_certificates: int
+    certificates: List[HardwareCertificatePinStatus]
+    error: Optional[str] = None

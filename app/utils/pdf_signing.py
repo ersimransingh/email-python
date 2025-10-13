@@ -5,8 +5,10 @@ PDF Digital Signing utilities using endesive and PyKCS11
 import io
 import os
 import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from pathlib import Path
+
+from app.services.certificate_pin_manager import CertificatePinManager
 
 # Configuration for PDF signing
 DEFAULT_TOKEN_PIN = "Secmark123"
@@ -42,11 +44,20 @@ DEFAULT_TOKEN_LABEL_HINTS = ["Secmark", "Card", "A33F79EEA4260E4B"]
 class SafeNetTokenSigner:
     """Minimal helper to interact with SafeNet (or compatible) USB tokens via PKCS#11."""
 
-    def __init__(self, pin: str, library_path: str, label_hints: List[str]):
+    def __init__(
+        self,
+        pin: str,
+        library_path: str,
+        label_hints: List[str],
+        pin_resolver: Optional[Callable[[str, int], Optional[str]]] = None,
+        auth_callback: Optional[Callable[[str, int, bool, Optional[str]], None]] = None,
+    ):
         self.pin = pin
         self.library_path = library_path
         self.pkcs11_lib = library_path  # Backwards-compatible attribute name
         self.label_hints = label_hints
+        self.pin_resolver = pin_resolver
+        self.auth_callback = auth_callback
         self.pkcs11 = None
         self.session = None
         self._cached_certificate = None
@@ -114,13 +125,40 @@ class SafeNetTokenSigner:
                 target_label = token_info.label.strip()
                 print(f"[WARN] Using first available token: {target_label}")
 
-            self.session = self.pkcs11.openSession(
-                target_slot, PK11.CKF_SERIAL_SESSION | PK11.CKF_RW_SESSION
-            )
-            self.session.login(self.pin)
+            resolved_pin: Optional[str] = None
+            if self.pin_resolver:
+                try:
+                    resolved_pin = self.pin_resolver(target_label, target_slot)
+                except Exception as pin_resolve_error:
+                    print(f"[WARN] Could not resolve stored PIN for token '{target_label}': {pin_resolve_error}")
+                else:
+                    if resolved_pin:
+                        self.pin = resolved_pin
+                        print(f"[INFO] Using resolved PIN for token '{target_label}'")
+
             self.slot_id = target_slot
             self.token_label = target_label
+
+            try:
+                self.session = self.pkcs11.openSession(
+                    target_slot, PK11.CKF_SERIAL_SESSION | PK11.CKF_RW_SESSION
+                )
+                self.session.login(self.pin)
+            except Exception as login_error:
+                if self.auth_callback:
+                    try:
+                        self.auth_callback(target_label, target_slot, False, str(login_error))
+                    except Exception as callback_error:
+                        print(f"[WARN] Auth callback failed: {callback_error}")
+                self.cleanup()
+                raise
+
             print(f"[OK] Successfully logged into SafeNet token '{target_label}'")
+            if self.auth_callback:
+                try:
+                    self.auth_callback(target_label, target_slot, True, None)
+                except Exception as callback_error:
+                    print(f"[WARN] Auth callback failed: {callback_error}")
 
         except Exception as error:
             print(f"[ERROR] Login failed: {error}")
@@ -252,6 +290,7 @@ class PDFSigner:
         self.certificate_password = certificate_password or DEFAULT_CERTIFICATE_PASSWORD
         self.token_pin = token_pin or os.environ.get('PDF_SIGNER_TOKEN_PIN', DEFAULT_TOKEN_PIN)
         self.pkcs11_library_path = os.environ.get('PDF_SIGNER_PKCS11_LIB', DEFAULT_PKCS11_LIBRARY)
+        self.pin_manager = CertificatePinManager(self.pkcs11_library_path)
         hints_env = os.environ.get('PDF_SIGNER_TOKEN_HINTS')
         if hints_env:
             self.token_label_hints = [hint.strip() for hint in hints_env.split(',') if hint.strip()]
@@ -309,6 +348,26 @@ class PDFSigner:
         self._packages_installed = True
         return True
 
+    def _resolve_token_pin(self, token_label: str, slot_id: int) -> Optional[str]:
+        """Resolve the appropriate PIN for a hardware token."""
+        try:
+            if self.pin_manager:
+                stored_pin = self.pin_manager.get_pin(token_label)
+                if stored_pin:
+                    return stored_pin
+        except Exception as resolve_error:
+            print(f"[WARN] Failed to resolve stored PIN for token '{token_label}': {resolve_error}")
+        return self.token_pin
+
+    def _on_token_auth(self, token_label: str, slot_id: int, success: bool, error: Optional[str]) -> None:
+        """Record authentication outcome for a token PIN."""
+        if not self.pin_manager:
+            return
+        try:
+            self.pin_manager.record_validation(token_label, None, success, error)
+        except Exception as record_error:
+            print(f"[WARN] Failed to record token authentication status: {record_error}")
+
     def get_hardware_token_status(self) -> Dict[str, Any]:
         """Check hardware token availability and certificate presence."""
         status: Dict[str, Any] = {
@@ -319,6 +378,10 @@ class PDFSigner:
             "slot_id": None,
             "available": False,
             "error": None,
+            "pin_configured": False,
+            "pin_valid": None,
+            "pin_last_verified_at": None,
+            "pin_last_error": None,
         }
 
         try:
@@ -332,6 +395,8 @@ class PDFSigner:
                 self.token_pin,
                 self.pkcs11_library_path,
                 self.token_label_hints,
+                pin_resolver=self._resolve_token_pin,
+                auth_callback=self._on_token_auth,
             ) as token_signer:
                 token_signer.login()
                 status["token_present"] = True
@@ -360,6 +425,15 @@ class PDFSigner:
                                 status["certificate_not_valid_after"] = cert_obj.not_valid_after.isoformat()
                             except Exception:
                                 pass
+                    if self.pin_manager and status.get("token_label"):
+                        certificate_key = status.get("certificate_id")
+                        pin_entry = self.pin_manager.get_entry(status["token_label"], certificate_key)
+                        if not pin_entry:
+                            pin_entry = self.pin_manager.get_entry(status["token_label"])
+                        status["pin_configured"] = bool(pin_entry)
+                        status["pin_valid"] = pin_entry.get("pin_valid") if pin_entry else None
+                        status["pin_last_verified_at"] = pin_entry.get("last_verified_at") if pin_entry else None
+                        status["pin_last_error"] = pin_entry.get("last_verification_error") if pin_entry else None
         except Exception as error:
             status["error"] = str(error)
 
@@ -714,9 +788,23 @@ class PDFSigner:
             self.token_pin,
             self.pkcs11_library_path,
             self.token_label_hints,
+            pin_resolver=self._resolve_token_pin,
+            auth_callback=self._on_token_auth,
         ) as token_signer:
             token_signer.login()
             certificate_tuple = token_signer.certificate()
+            certificate_id_hex: Optional[str] = None
+            if certificate_tuple:
+                cert_identifier = certificate_tuple[0]
+                if isinstance(cert_identifier, (bytes, bytearray)):
+                    certificate_id_hex = cert_identifier.hex().upper()
+                elif cert_identifier is not None:
+                    certificate_id_hex = str(cert_identifier)
+            if self.pin_manager and token_signer.token_label and certificate_id_hex:
+                try:
+                    self.pin_manager.record_validation(token_signer.token_label, certificate_id_hex, True, None)
+                except Exception as record_error:
+                    print(f"[WARN] Failed to record certificate PIN validation: {record_error}")
 
             class _TokenHSMBridge(hsm_module.BaseHSM):
                 def __init__(self, signer, cert_tuple):

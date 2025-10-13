@@ -172,6 +172,8 @@ async def api_info():
                 "GET /api/check-email-config - Check if email config exists",
                 "GET /api/certificate-status - Check USB certificate availability",
                 "GET /api/certificates - List all certificates on the computer",
+                "POST /api/certificates/pins - Save hardware certificate PINs",
+                "GET /api/certificates/pins/status - Check stored certificate PIN status",
                 "POST /api/email-test - Send test email",
                 "POST /api/email-force-process - Force process email queue",
                 "GET /api/dashboard - Get dashboard data"
