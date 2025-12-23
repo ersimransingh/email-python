@@ -95,10 +95,17 @@ class PDFPasswordProtector:
             True if data appears to be a PDF
         """
         try:
-            # Check PDF magic header
-            if data.startswith(b'%PDF-'):
-                return True
-            return False
+            if data is None:
+                return False
+            if isinstance(data, memoryview):
+                data = data.tobytes()
+            elif isinstance(data, bytearray):
+                data = bytes(data)
+            elif not isinstance(data, (bytes, bytearray)):
+                data = bytes(data)
+
+            header = data[:1024]
+            return b'%PDF-' in header
         except Exception:
             return False
 

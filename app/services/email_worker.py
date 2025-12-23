@@ -64,7 +64,10 @@ class EmailWorker:
                 self.scheduler.start()
 
             print(f"Email worker started at {self.started_at}")
-            print(f"Schedule: {config.start_time} to {config.end_time}, every {config.interval} {config.interval_unit}")
+            # Normalize and display time format
+            normalized_start = self._normalize_time_format(config.start_time)
+            normalized_end = self._normalize_time_format(config.end_time)
+            print(f"Schedule: {normalized_start} to {normalized_end}, every {config.interval} {config.interval_unit}")
 
         except Exception as e:
             raise Exception(f"Failed to start email worker: {str(e)}")
@@ -137,9 +140,22 @@ class EmailWorker:
         finally:
             self.is_processing = False
 
+    def _normalize_time_format(self, time_str: str) -> str:
+        """Normalize time format to HH:MM. Supports both 'HHmm' and 'HH:MM' formats."""
+        time_str = time_str.strip()
+        # If format is HHmm (4 digits without colon), convert to HH:MM
+        if len(time_str) == 4 and time_str.isdigit():
+            return f"{time_str[:2]}:{time_str[2:]}"
+        # Already in HH:MM format
+        return time_str
+
     def is_within_schedule(self, start_time: str, end_time: str) -> bool:
-        """Check if current time is within service schedule"""
+        """Check if current time is within service schedule. Supports both 'HHmm' and 'HH:MM' formats."""
         try:
+            # Normalize time formats
+            start_time = self._normalize_time_format(start_time)
+            end_time = self._normalize_time_format(end_time)
+
             current_time = datetime.now().time()
             start = datetime.strptime(start_time, "%H:%M").time()
             end = datetime.strptime(end_time, "%H:%M").time()
@@ -191,7 +207,9 @@ class EmailWorker:
         try:
             # Check if we're within the scheduled time window
             if not self.is_within_schedule(self.config.start_time, self.config.end_time):
-                print(f"Outside scheduled hours ({self.config.start_time} - {self.config.end_time}). Skipping email processing.")
+                normalized_start = self._normalize_time_format(self.config.start_time)
+                normalized_end = self._normalize_time_format(self.config.end_time)
+                print(f"Outside scheduled hours ({normalized_start} - {normalized_end}). Skipping email processing.")
                 return
 
             if self.is_processing:
@@ -238,9 +256,10 @@ class EmailWorker:
         if not self.config:
             return {"error": "No configuration loaded"}
 
+        # Return normalized time format for consistency
         return {
-            "start_time": self.config.start_time,
-            "end_time": self.config.end_time,
+            "start_time": self._normalize_time_format(self.config.start_time),
+            "end_time": self._normalize_time_format(self.config.end_time),
             "interval": self.config.interval,
             "interval_unit": self.config.interval_unit,
             "is_active": self.scheduler.running,

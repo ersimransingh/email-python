@@ -1,6 +1,8 @@
 import asyncio
 import aiosmtplib
 import smtplib
+import os
+from dataclasses import dataclass
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -17,16 +19,40 @@ from app.utils.pdf_utils import PDFPasswordProtector
 from app.utils.pdf_signing import PDFSigner
 
 
+@dataclass
+class _SMTPConnectionHandle:
+    smtp: aiosmtplib.SMTP
+    emails_sent: int
+    last_activity: datetime
+
+
+class _SMTPPool:
+    def __init__(self, smtp_config: SMTPConfig, max_size: int):
+        self.smtp_config = smtp_config
+        self.max_size = max_size
+        self.queue: asyncio.Queue[_SMTPConnectionHandle] = asyncio.Queue()
+        self.created = 0
+        self.lock = asyncio.Lock()
+
+
 class EmailService:
     def __init__(self):
         self.smtp_connection: Optional[aiosmtplib.SMTP] = None
         self.current_smtp_config: Optional[SMTPConfig] = None
         self.connection_lock = asyncio.Lock()
         self.last_activity = None
-        self.connection_timeout = 300  # 5 minutes idle timeout
-        self.max_emails_per_connection = 100  # Reconnect after N emails
+        self.connection_timeout = int(os.environ.get("SMTP_CONNECTION_TIMEOUT", "300"))  # 5 minutes idle timeout
+        self.max_emails_per_connection = int(os.environ.get("SMTP_MAX_EMAILS_PER_CONNECTION", "100"))
         self.emails_sent_count = 0
         self.pdf_signer = PDFSigner()  # Initialize PDF signer
+        self.smtp_pools: Dict[str, _SMTPPool] = {}
+        self.max_send_concurrency = max(1, int(os.environ.get("EMAIL_SEND_CONCURRENCY", "10")))
+        self.smtp_pool_size = max(1, int(os.environ.get("SMTP_POOL_SIZE", str(self.max_send_concurrency))))
+        self.queue_batch_size = max(1, int(os.environ.get("EMAIL_QUEUE_BATCH_SIZE", "500")))
+        self.queue_batch_cap = max(self.queue_batch_size, int(os.environ.get("EMAIL_QUEUE_MAX_BATCH", "5000")))
+        self.send_delay_seconds = max(0.0, float(os.environ.get("EMAIL_SEND_DELAY_SECONDS", "0")))
+        self.sign_all_pdfs = os.environ.get("EMAIL_SIGN_ALL_PDFS", "true").lower() in ("1", "true", "yes")
+        self.default_signer_name = os.environ.get("PDF_SIGNER_DEFAULT_NAME")
 
     async def get_hardware_certificate_status(self) -> Dict[str, Any]:
         """Return current status of the USB hardware certificate token."""
@@ -117,16 +143,17 @@ class EmailService:
             print(f"Error getting SMTP details by param code: {e}")
             return None
 
-    async def _is_connection_healthy(self) -> bool:
-        """Check if current SMTP connection is still healthy"""
-        if not self.smtp_connection:
+    async def _is_connection_healthy(self, smtp: Optional[aiosmtplib.SMTP] = None) -> bool:
+        """Check if an SMTP connection is still healthy"""
+        smtp = smtp or self.smtp_connection
+        if not smtp:
             return False
 
         try:
             # Send NOOP command to check connection
-            await self.smtp_connection.noop()
+            await smtp.noop()
             return True
-        except:
+        except Exception:
             return False
 
     async def _should_reconnect(self) -> bool:
@@ -150,8 +177,8 @@ class EmailService:
 
         return False
 
-    async def _close_smtp_connection(self):
-        """Safely close the current SMTP connection"""
+    async def _close_smtp_connection(self, close_pools: bool = True):
+        """Safely close SMTP connections"""
         if self.smtp_connection:
             try:
                 await self.smtp_connection.quit()
@@ -160,6 +187,8 @@ class EmailService:
             finally:
                 self.smtp_connection = None
                 self.emails_sent_count = 0
+        if close_pools:
+            await self._close_all_smtp_pools()
 
     async def _create_smtp_connection(self, smtp_config: SMTPConfig) -> aiosmtplib.SMTP:
         """Create a new SMTP connection with improved timeout and error handling"""
@@ -186,7 +215,7 @@ class EmailService:
         print("=" * 60)
 
         # Increased timeout for better reliability
-        connection_timeout = 60  # 1 minute timeout
+        connection_timeout = 180  # 180 seconds (3 minutes) timeout for port 587 STARTTLS
 
         # Try multiple connection strategies
         connection_strategies = []
@@ -197,27 +226,21 @@ class EmailService:
                 "hostname": smtp_config.smtp_server,
                 "port": smtp_config.smtp_port,
                 "use_tls": True,
+                "start_tls": False,
                 "timeout": connection_timeout,
                 "validate_certs": False  # Match Node.js rejectUnauthorized: false
             }))
         else:
             # Strategies for port 587 (STARTTLS)
-            connection_strategies.extend([
-                ("STARTTLS", {
-                    "hostname": smtp_config.smtp_server,
-                    "port": smtp_config.smtp_port,
-                    "use_tls": False,
-                    "timeout": connection_timeout,
-                    "validate_certs": False  # Match Node.js rejectUnauthorized: false
-                }),
-                ("Direct TLS (fallback)", {
-                    "hostname": smtp_config.smtp_server,
-                    "port": smtp_config.smtp_port,
-                    "use_tls": True,
-                    "timeout": connection_timeout,
-                    "validate_certs": False  # Match Node.js rejectUnauthorized: false
-                })
-            ])
+            # IMPORTANT: For port 587, use_tls should be False, then manually call starttls()
+            connection_strategies.append(("STARTTLS", {
+                "hostname": smtp_config.smtp_server,
+                "port": smtp_config.smtp_port,
+                "use_tls": False,
+                "start_tls": False,  # Don't auto-starttls, we'll do it manually
+                "timeout": connection_timeout,
+                "validate_certs": False  # Match Node.js rejectUnauthorized: false
+            }))
 
         last_error = None
 
@@ -230,16 +253,22 @@ class EmailService:
                 await smtp.connect()
                 print("SUCCESS: Connected successfully!")
 
-                # Check if we need to do STARTTLS
-                if strategy_name == "STARTTLS" and smtp_config.smtp_ssl_flag == "Y":
+                # Check if we need to do STARTTLS (for port 587)
+                if strategy_name == "STARTTLS":
                     try:
                         print("Starting TLS encryption via STARTTLS...")
-                        await smtp.starttls()
-                        print("SUCCESS: TLS encryption started!")
+                        # Check if STARTTLS is supported
+                        if smtp.supports_extension("STARTTLS"):
+                            await smtp.starttls(validate_certs=False)
+                            print("SUCCESS: TLS encryption started!")
+                        else:
+                            print("WARNING: Server doesn't advertise STARTTLS support, attempting anyway...")
+                            await smtp.starttls(validate_certs=False)
+                            print("SUCCESS: TLS encryption started!")
                     except Exception as tls_error:
                         print(f"TLS Error: {tls_error}")
                         # If STARTTLS fails, the connection might already be encrypted
-                        if "already using TLS" in str(tls_error):
+                        if "already using TLS" in str(tls_error).lower():
                             print("INFO: Connection appears to already be using TLS")
                         else:
                             raise tls_error
@@ -274,8 +303,8 @@ class EmailService:
             if await self._should_reconnect():
                 print("Connection needs refresh - creating new connection...")
 
-                # Close existing connection
-                await self._close_smtp_connection()
+                # Close existing connection without affecting pooled connections
+                await self._close_smtp_connection(close_pools=False)
 
                 # Create new connection
                 self.smtp_connection = await self._create_smtp_connection(smtp_config)
@@ -291,7 +320,104 @@ class EmailService:
             self.last_activity = datetime.now()
             return self.smtp_connection
 
-    async def send_email_with_attachment(self, email_record: EmailRecord) -> EmailResult:
+    def _make_smtp_pool_key(self, smtp_config: SMTPConfig) -> str:
+        return "|".join(
+            [
+                smtp_config.smtp_server or "",
+                str(smtp_config.smtp_port or ""),
+                smtp_config.smtp_account_name or "",
+                smtp_config.param_code or "",
+            ]
+        )
+
+    def _get_smtp_pool(self, smtp_config: SMTPConfig) -> _SMTPPool:
+        pool_key = self._make_smtp_pool_key(smtp_config)
+        pool = self.smtp_pools.get(pool_key)
+        if pool is None:
+            pool = _SMTPPool(smtp_config, self.smtp_pool_size)
+            self.smtp_pools[pool_key] = pool
+        return pool
+
+    async def _should_reconnect_handle(self, handle: _SMTPConnectionHandle) -> bool:
+        if handle.emails_sent >= self.max_emails_per_connection:
+            return True
+        if handle.last_activity and (datetime.now() - handle.last_activity).total_seconds() > self.connection_timeout:
+            return True
+        if not await self._is_connection_healthy(handle.smtp):
+            return True
+        return False
+
+    async def _acquire_smtp_handle(self, smtp_config: SMTPConfig) -> tuple[_SMTPPool, _SMTPConnectionHandle]:
+        pool = self._get_smtp_pool(smtp_config)
+        try:
+            handle = pool.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            handle = None
+
+        if handle is None:
+            async with pool.lock:
+                if pool.created < pool.max_size:
+                    smtp = await self._create_smtp_connection(smtp_config)
+                    handle = _SMTPConnectionHandle(smtp=smtp, emails_sent=0, last_activity=datetime.now())
+                    pool.created += 1
+            if handle is None:
+                handle = await pool.queue.get()
+
+        if await self._should_reconnect_handle(handle):
+            await self._discard_smtp_handle(pool, handle)
+            smtp = await self._create_smtp_connection(smtp_config)
+            handle = _SMTPConnectionHandle(smtp=smtp, emails_sent=0, last_activity=datetime.now())
+            async with pool.lock:
+                pool.created += 1
+
+        return pool, handle
+
+    async def _release_smtp_handle(self, pool: _SMTPPool, handle: _SMTPConnectionHandle) -> None:
+        handle.last_activity = datetime.now()
+        await pool.queue.put(handle)
+
+    async def _discard_smtp_handle(self, pool: _SMTPPool, handle: _SMTPConnectionHandle) -> None:
+        try:
+            await handle.smtp.quit()
+        except Exception:
+            pass
+        async with pool.lock:
+            pool.created = max(0, pool.created - 1)
+
+    async def _close_all_smtp_pools(self):
+        for pool in self.smtp_pools.values():
+            while True:
+                try:
+                    handle = pool.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                try:
+                    await handle.smtp.quit()
+                except Exception:
+                    pass
+            pool.created = 0
+        self.smtp_pools = {}
+
+    @staticmethod
+    def _coerce_bytes(value: Optional[bytes]) -> Optional[bytes]:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, bytearray):
+            return bytes(value)
+        if isinstance(value, memoryview):
+            return value.tobytes()
+        try:
+            return bytes(value)
+        except Exception:
+            return None
+
+    async def send_email_with_attachment(
+        self,
+        email_record: EmailRecord,
+        signing_status: Optional[Dict[str, Any]] = None,
+    ) -> EmailResult:
         """Send email with PDF attachment"""
         try:
             # Get SMTP configuration
@@ -324,30 +450,44 @@ class EmailService:
             # Track if a new protected PDF was created
             new_protected_pdf = None
             signing_info_saved = False
+            signing_required = False
 
             # Add attachment if exists
             if email_record.dd_document and email_record.dd_filename:
                 # Determine which document to use as attachment
-                attachment_data = email_record.dd_document
+                attachment_data = self._coerce_bytes(email_record.dd_document)
                 filename = email_record.dd_filename
+
+                if not attachment_data:
+                    return EmailResult(
+                        success=False,
+                        recipient=email_record.dd_to_emailid,
+                        cc=email_record.dd_cc_emailid,
+                        error="Attachment data is missing or invalid"
+                    )
 
                 # Check if password protection is needed and document is a PDF
                 if (email_record.dd_encpassword and
                     email_record.dd_encpassword.strip() and
-                    PDFPasswordProtector.is_pdf_data(email_record.dd_document)):
+                    PDFPasswordProtector.is_pdf_data(attachment_data)):
 
                     print(f"PDF password protection required for email ID {email_record.dd_srno}")
 
                     # Check if we already have a protected version
                     if email_record.dd_finaldocument:
                         print("Using existing password-protected PDF from dd_finaldocument")
-                        attachment_data = email_record.dd_finaldocument
+                        existing_protected = self._coerce_bytes(email_record.dd_finaldocument)
+                        if existing_protected:
+                            attachment_data = existing_protected
+                        else:
+                            print("Stored password-protected PDF is invalid; recreating...")
+                            email_record.dd_finaldocument = None
                     else:
                         print("Creating new password-protected PDF...")
                         try:
                             # Protect the PDF with password
                             protected_pdf = PDFPasswordProtector.protect_pdf_with_password(
-                                email_record.dd_document,
+                                attachment_data,
                                 email_record.dd_encpassword
                             )
 
@@ -369,112 +509,135 @@ class EmailService:
 
                 # Check if PDF digital signing is needed
                 signing_flag_enabled = (email_record.dd_signed_flag or "").strip().upper() == "Y"
+                is_pdf_attachment = PDFPasswordProtector.is_pdf_data(attachment_data)
+                signing_required = is_pdf_attachment and (self.sign_all_pdfs or signing_flag_enabled)
                 signer_name = (email_record.dd_signedby or "").strip()
 
-                if signing_flag_enabled:
-                    if not PDFPasswordProtector.is_pdf_data(attachment_data):
-                        print(f"Signing flag enabled for email ID {email_record.dd_srno} but attachment is not a PDF; skipping digital signature.")
-                    elif not signer_name:
-                        print(f"Signing flag enabled for email ID {email_record.dd_srno} but signer name is missing; skipping digital signature.")
-                    else:
-                        print(f"PDF digital signing required for email ID {email_record.dd_srno} by {signer_name}")
-                        token_status = await self.get_hardware_certificate_status()
-                        if not token_status.get("available"):
-                            default_reason = ("Hardware token not detected"
-                                               if not token_status.get("token_present")
-                                               else "Certificate not found on hardware token")
-                            reason = token_status.get("error") or default_reason
-                            token_label = token_status.get("token_label") or "unknown"
-                            print(
-                                f"Digital signing required but certificate unavailable for email ID {email_record.dd_srno}: {reason} "
-                                f"(token label: {token_label}). Skipping this email - it will remain pending."
-                            )
-                            # Instead of failing the entire process, just skip this email that requires signing
-                            # Return a skipped result (not an error) so the process continues with other emails
-                            return EmailResult(
-                                success=False,
-                                recipient=email_record.dd_to_emailid,
-                                cc=email_record.dd_cc_emailid,
-                                error=f"Digital signing required but certificate unavailable: {reason}. Email skipped - will retry when certificate is available.",
-                                retry_later=True
-                            )
-                        try:
-                            signing_result = self.pdf_signer.sign_pdf_with_certificate(
-                                attachment_data,
-                                signer_name,
-                                pdf_password=(
-                                    email_record.dd_encpassword.strip()
-                                    if email_record.dd_encpassword and email_record.dd_encpassword.strip()
-                                    else None
-                                ),
-                            )
+                if signing_required:
+                    if not signer_name:
+                        signer_name = self.default_signer_name or smtp_config.application_name or "Digital Signature"
 
-                            if signing_result["success"]:
-                                if signing_result.get("signed_pdf"):
-                                    attachment_data = signing_result["signed_pdf"]
-                                    print("PDF successfully digitally signed")
+                    print(f"PDF digital signing required for email ID {email_record.dd_srno} by {signer_name}")
+                    signing_status = signing_status or self.pdf_signer.get_signing_status()
+                    if not signing_status.get("available"):
+                        pkcs12_status = signing_status.get("pkcs12") or {}
+                        hardware_status = signing_status.get("hardware") or {}
+                        reason = pkcs12_status.get("error") or hardware_status.get("error") or "Signing certificate unavailable"
+                        token_label = hardware_status.get("token_label") or "unknown"
+                        print(
+                            f"Digital signing required but certificate unavailable for email ID {email_record.dd_srno}: {reason} "
+                            f"(token label: {token_label}). Skipping this email - it will remain pending."
+                        )
+                        return EmailResult(
+                            success=False,
+                            recipient=email_record.dd_to_emailid,
+                            cc=email_record.dd_cc_emailid,
+                            error=f"Digital signing required but certificate unavailable: {reason}. Email skipped - will retry when certificate is available.",
+                            retry_later=True
+                        )
 
-                                    email_record.dd_signedby = signer_name
-                                    email_record.dd_signedon = signing_result["signed_on"]
-                                    email_record.dd_signedtm = signing_result["signed_time"]
+                    try:
+                        signing_result = await asyncio.to_thread(
+                            self.pdf_signer.sign_pdf_with_certificate,
+                            attachment_data,
+                            signer_name,
+                            pdf_password=(
+                                email_record.dd_encpassword.strip()
+                                if email_record.dd_encpassword and email_record.dd_encpassword.strip()
+                                else None
+                            ),
+                        )
+                    except Exception as signing_error:
+                        print(f"Error during PDF signing: {signing_error}")
+                        return EmailResult(
+                            success=False,
+                            recipient=email_record.dd_to_emailid,
+                            cc=email_record.dd_cc_emailid,
+                            error=f"PDF signing failed: {signing_error}"
+                        )
 
-                                    try:
-                                        await self.save_signing_info(
-                                            email_record.dd_srno,
-                                            signer_name,
-                                            email_record.dd_signedon,
-                                            email_record.dd_signedtm,
-                                        )
-                                        signing_info_saved = True
-                                    except Exception as signing_save_error:
-                                        print(f"Warning: Signed PDF but failed to save signing information: {signing_save_error}")
-                                else:
-                                    print("PDF signing completed but no signed data returned")
-                            else:
-                                print(f"PDF signing failed: {signing_result.get('error', 'Unknown error')}")
-                                print("Proceeding with unsigned PDF")
-                        except Exception as signing_error:
-                            print(f"Error during PDF signing: {signing_error}")
-                            print("Proceeding with unsigned PDF")
+                    if not signing_result.get("success") or not signing_result.get("signed_pdf"):
+                        error_message = signing_result.get("error", "Unknown error")
+                        print(f"PDF signing failed: {error_message}")
+                        return EmailResult(
+                            success=False,
+                            recipient=email_record.dd_to_emailid,
+                            cc=email_record.dd_cc_emailid,
+                            error=f"PDF signing failed: {error_message}"
+                        )
+
+                    attachment_data = signing_result["signed_pdf"]
+                    print("PDF successfully digitally signed")
+
+                    email_record.dd_signedby = signer_name
+                    email_record.dd_signedon = signing_result["signed_on"]
+                    email_record.dd_signedtm = signing_result["signed_time"]
+
+                    try:
+                        await self.save_signing_info(
+                            email_record.dd_srno,
+                            signer_name,
+                            email_record.dd_signedon,
+                            email_record.dd_signedtm,
+                        )
+                        signing_info_saved = True
+                    except Exception as signing_save_error:
+                        print(f"Warning: Signed PDF but failed to save signing information: {signing_save_error}")
                 else:
-                    print(f"Digital signing not required for email ID {email_record.dd_srno} (dd_signed_flag: {email_record.dd_signed_flag or 'N'}) - proceeding with email sending")
+                    print(
+                        f"Digital signing not required for email ID {email_record.dd_srno} "
+                        f"(dd_signed_flag: {email_record.dd_signed_flag or 'N'}, sign_all: {self.sign_all_pdfs}) - proceeding with email sending"
+                    )
 
                 attachment = MIMEApplication(attachment_data, Name=filename)
                 attachment['Content-Disposition'] = f'attachment; filename="{filename}"'
                 message.attach(attachment)
 
-            # Get persistent SMTP connection instead of creating new one
-            smtp = await self._get_smtp_connection(smtp_config)
+            pool = None
+            smtp_handle = None
+            release_handle = False
+            try:
+                pool, smtp_handle = await self._acquire_smtp_handle(smtp_config)
+                smtp = smtp_handle.smtp
+                release_handle = True
 
-            recipients = [email_record.dd_to_emailid]
-            if email_record.dd_cc_emailid:
-                cc_addresses = [addr.strip() for addr in email_record.dd_cc_emailid.split(",")]
-                recipients.extend(cc_addresses)
-                print(f"CC Recipients: {cc_addresses}")
+                recipients = [email_record.dd_to_emailid]
+                if email_record.dd_cc_emailid:
+                    cc_addresses = [addr.strip() for addr in email_record.dd_cc_emailid.split(",")]
+                    recipients.extend(cc_addresses)
+                    print(f"CC Recipients: {cc_addresses}")
 
-            message_id = str(uuid.uuid4())
-            message["Message-ID"] = f"<{message_id}@{smtp_config.smtp_server}>"
+                message_id = str(uuid.uuid4())
+                message["Message-ID"] = f"<{message_id}@{smtp_config.smtp_server}>"
 
-            print(f"Sending email via persistent connection (email #{self.emails_sent_count + 1})...")
-            print(f"TO: {email_record.dd_to_emailid}")
-            print(f"CC: {email_record.dd_cc_emailid or 'None'}")
-            print(f"Total Recipients: {recipients}")
-            send_errors, server_response = await smtp.send_message(message, recipients=recipients)
+                print(f"Sending email via pooled connection...")
+                print(f"TO: {email_record.dd_to_emailid}")
+                print(f"CC: {email_record.dd_cc_emailid or 'None'}")
+                print(f"Total Recipients: {recipients}")
+                send_errors, server_response = await smtp.send_message(message, recipients=recipients)
 
-            if send_errors:
-                error_messages = "; ".join(
-                    f"{recipient}: {resp.code} {resp.message}"
-                    for recipient, resp in send_errors.items()
-                )
-                print(f"SMTP rejected recipient(s): {error_messages}")
-                raise Exception(f"SMTP rejected recipient(s): {error_messages}")
+                if send_errors:
+                    error_messages = "; ".join(
+                        f"{recipient}: {resp.code} {resp.message}"
+                        for recipient, resp in send_errors.items()
+                    )
+                    print(f"SMTP rejected recipient(s): {error_messages}")
+                    raise Exception(f"SMTP rejected recipient(s): {error_messages}")
 
-            if server_response:
-                print(f"SMTP response: {server_response}")
+                if server_response:
+                    print(f"SMTP response: {server_response}")
 
-            # Increment counter but don't close connection (persistent)
-            self.emails_sent_count += 1
-            print(f"Email sent successfully using persistent connection!")
+                smtp_handle.emails_sent += 1
+                self.emails_sent_count += 1
+                print(f"Email sent successfully using pooled connection!")
+            except Exception:
+                if pool is not None and smtp_handle is not None:
+                    release_handle = False
+                    await self._discard_smtp_handle(pool, smtp_handle)
+                raise
+            finally:
+                if release_handle and pool is not None and smtp_handle is not None:
+                    await self._release_smtp_handle(pool, smtp_handle)
 
             # If a new protected PDF was created, save it to the database
             if new_protected_pdf:
@@ -484,7 +647,7 @@ class EmailService:
                     print(f"Warning: Email sent successfully but failed to save protected PDF: {pdf_save_error}")
 
             # If PDF signing information was updated, save it to the database
-            if ((email_record.dd_signed_flag or "").strip().upper() == "Y" and
+            if (signing_required and
                 email_record.dd_signedby and
                 email_record.dd_signedon and
                 email_record.dd_signedtm and
@@ -508,8 +671,8 @@ class EmailService:
 
         except Exception as e:
             print(f"Error sending email: {str(e)}")
-            # On error, close connection to ensure clean state for next attempt
-            await self._close_smtp_connection()
+            # Avoid tearing down pooled connections for a single message failure
+            await self._close_smtp_connection(close_pools=False)
 
             return EmailResult(
                 success=False,
@@ -587,7 +750,7 @@ class EmailService:
         except Exception as e:
             print(f"Error sending test email: {str(e)}")
             # Close connection on error
-            await self._close_smtp_connection()
+            await self._close_smtp_connection(close_pools=False)
 
             return EmailResult(
                 success=False,
@@ -612,7 +775,7 @@ class EmailService:
                 # SQL Server doesn't support parameterized TOP, so we'll use string formatting
                 # with a safe integer limit
                 safe_limit = int(limit) if isinstance(limit, (int, str)) and str(limit).isdigit() else 50
-                safe_limit = min(safe_limit, 1000)  # Cap at 1000 for safety
+                safe_limit = min(safe_limit, self.queue_batch_cap)
 
                 # Build WHERE clause based on parameters
                 if include_high_retry:
@@ -642,9 +805,11 @@ class EmailService:
                 emails_not_requiring_signing = 0
                 
                 for row in rows:
+                    document_data = self._coerce_bytes(row.dd_document)
+                    final_document_data = self._coerce_bytes(row.dd_Finaldocument)
                     email_record = EmailRecord(
                         dd_srno=row.dd_srno,
-                        dd_document=row.dd_document,
+                        dd_document=document_data,
                         dd_filename=row.dd_filename,
                         dd_to_emailid=row.dd_toEmailid,
                         dd_cc_emailid=row.dd_ccEmailid,
@@ -654,7 +819,7 @@ class EmailService:
                         dd_email_param_code=row.dd_EmailParamCode,
                         dd_retry_count=row.dd_RetryCount,
                         dd_encpassword=row.dd_Encpassword,
-                        dd_finaldocument=row.dd_Finaldocument,
+                        dd_finaldocument=final_document_data,
                         dd_signed_flag=row.dd_signedFlag,
                         dd_signedby=row.dd_signedby,
                         dd_signedon=row.dd_signedon,
@@ -788,57 +953,96 @@ class EmailService:
             print(f"Error saving signing information: {e}")
 
     async def process_email_queue(self, include_high_retry: bool = False) -> ProcessingStats:
-        """Process all pending emails in queue using persistent connection
+        """Process all pending emails in queue using pooled SMTP connections.
 
         Args:
             include_high_retry: If True, processes emails even with retry_count >= 3
         """
-        stats = ProcessingStats(processed=0, success=0, failed=0)
+        stats = ProcessingStats(processed=0, success=0, failed=0, skipped=0)
+        batch_index = 0
 
         try:
-            pending_emails = await self.get_pending_emails(include_high_retry=include_high_retry)
-            total_emails = len(pending_emails)
+            while True:
+                pending_emails = await self.get_pending_emails(
+                    limit=self.queue_batch_size,
+                    include_high_retry=include_high_retry,
+                )
+                if not pending_emails:
+                    break
 
-            print(f"\nProcessing {total_emails} pending emails using persistent SMTP connection...")
-            
-            # Check certificate status upfront to inform about signing capabilities
-            try:
-                cert_status = await self.get_hardware_certificate_status()
-                cert_available = cert_status.get("available", False)
-                if cert_available:
-                    print(f"✓ Digital certificate is available - emails requiring signing will be processed normally")
-                else:
-                    cert_error = cert_status.get("error", "Certificate not found")
-                    print(f"⚠ Digital certificate is not available ({cert_error})")
-                    print(f"  - Emails with dd_signed_flag='Y' will be skipped and remain pending")
-                    print(f"  - Emails with dd_signed_flag='N' will be sent without signing")
-            except Exception as cert_check_error:
-                print(f"⚠ Could not check certificate status: {cert_check_error}")
-                print(f"  - Emails requiring signing may fail during processing")
+                batch_index += 1
+                total_emails = len(pending_emails)
+                print(
+                    f"\nProcessing batch {batch_index} with {total_emails} pending emails using pooled SMTP connections..."
+                )
 
-            for index, email_record in enumerate(pending_emails):
-                print(f"\n[{index + 1}/{total_emails}] Processing email ID {email_record.dd_srno}")
-                result = await self.send_email_with_attachment(email_record)
+                signing_status = None
+                signing_needed = self.sign_all_pdfs or any(
+                    (record.dd_signed_flag or '').strip().upper() == 'Y' for record in pending_emails
+                )
 
-                if getattr(result, "retry_later", False):
-                    stats.skipped += 1
-                    reason = result.error or "Deferred for retry"
-                    print(f"SKIPPED: Email {email_record.dd_srno} deferred: {reason}")
-                    continue
+                if signing_needed:
+                    signing_status = self.pdf_signer.get_signing_status()
+                    if signing_status.get('available'):
+                        if signing_status.get('pkcs12', {}).get('available') and not self.pdf_signer.force_hardware_token:
+                            print('Digital signing available via PKCS#12 certificate')
+                        else:
+                            print('Digital signing available via hardware token')
+                    else:
+                        pkcs12_status = signing_status.get('pkcs12') or {}
+                        hardware_status = signing_status.get('hardware') or {}
+                        reason = pkcs12_status.get('error') or hardware_status.get('error') or 'Signing certificate unavailable'
+                        print(f"Digital signing is not available ({reason})")
+                        print('  - Emails requiring signing will be skipped and remain pending')
 
-                stats.processed += 1
+                semaphore = asyncio.Semaphore(self.max_send_concurrency)
 
-                if result.success:
-                    await self.update_email_status(email_record.dd_srno, "Y", result.message_id)
-                    stats.success += 1
-                    print(f"SUCCESS: Email {email_record.dd_srno} sent and marked as successful")
-                else:
-                    await self.update_email_status(email_record.dd_srno, "F", error=result.error)
-                    stats.failed += 1
-                    print(f"FAILED: Email {email_record.dd_srno} failed: {result.error}")
+                async def _process_one(email_record: EmailRecord):
+                    async with semaphore:
+                        try:
+                            result = await self.send_email_with_attachment(
+                                email_record,
+                                signing_status=signing_status,
+                            )
+                        except Exception as error:
+                            result = EmailResult(
+                                success=False,
+                                recipient=email_record.dd_to_emailid,
+                                cc=email_record.dd_cc_emailid,
+                                error=str(error),
+                            )
 
-                if index < total_emails - 1:
-                    await asyncio.sleep(0.5)
+                        if self.send_delay_seconds > 0:
+                            await asyncio.sleep(self.send_delay_seconds)
+
+                        if getattr(result, 'retry_later', False):
+                            return 'skipped', email_record, result
+
+                        if result.success:
+                            await self.update_email_status(email_record.dd_srno, 'Y', result.message_id)
+                            return 'success', email_record, result
+
+                        await self.update_email_status(email_record.dd_srno, 'F', error=result.error)
+                        return 'failed', email_record, result
+
+                tasks = [asyncio.create_task(_process_one(email_record)) for email_record in pending_emails]
+
+                for task in asyncio.as_completed(tasks):
+                    status, email_record, result = await task
+
+                    if status == 'skipped':
+                        stats.skipped += 1
+                        reason = result.error or 'Deferred for retry'
+                        print(f"SKIPPED: Email {email_record.dd_srno} deferred: {reason}")
+                        continue
+
+                    stats.processed += 1
+                    if status == 'success':
+                        stats.success += 1
+                        print(f"SUCCESS: Email {email_record.dd_srno} sent and marked as successful")
+                    else:
+                        stats.failed += 1
+                        print(f"FAILED: Email {email_record.dd_srno} failed: {result.error}")
 
             await self._close_smtp_connection()
             print(

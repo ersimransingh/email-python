@@ -5,6 +5,8 @@ PDF Digital Signing utilities using endesive and PyKCS11
 import io
 import os
 import datetime
+import threading
+import time
 from typing import Optional, Dict, Any, List, Tuple, Callable
 from pathlib import Path
 
@@ -27,7 +29,7 @@ def _get_default_pkcs11_library():
         possible_paths = [
             os.path.join(os.environ.get('SYSTEMROOT', 'C:\\Windows'), 'System32', 'eTPKCS11.dll'),
             os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'System32', 'eTPKCS11.dll'),
-            r"C:\Windows\System32\eTPKCS11.dll",
+            r"C:\Windows\system32\cryptoida_pkcs11.dll",
         ]
         for path in possible_paths:
             if os.path.exists(path):
@@ -39,7 +41,7 @@ def _get_default_pkcs11_library():
     return "/usr/lib/libeTPkcs11.so"
 
 DEFAULT_PKCS11_LIBRARY = _get_default_pkcs11_library()
-DEFAULT_TOKEN_LABEL_HINTS = ["Secmark", "Card", "A33F79EEA4260E4B"]
+DEFAULT_TOKEN_LABEL_HINTS = ["Secmark", "Card", "A33F79EEA4260E4B", "mToken", "CryptoID", "CryptoIDA", "longmai"]
 
 class SafeNetTokenSigner:
     """Minimal helper to interact with SafeNet (or compatible) USB tokens via PKCS#11."""
@@ -110,7 +112,7 @@ class SafeNetTokenSigner:
             target_label = None
             for slot in slots:
                 token_info = self.pkcs11.getTokenInfo(slot)
-                token_name = token_info.label.strip()
+                token_name = token_info.label.strip().rstrip('\x00')  # Remove trailing null bytes
                 print(f"[INFO] Found token: '{token_name}' in slot {slot}")
                 token_name_normalised = token_name.lower()
                 if any(hint in token_name_normalised for hint in label_hints_lower):
@@ -122,7 +124,7 @@ class SafeNetTokenSigner:
             if target_slot is None:
                 target_slot = slots[0]
                 token_info = self.pkcs11.getTokenInfo(target_slot)
-                target_label = token_info.label.strip()
+                target_label = token_info.label.strip().rstrip('\x00')  # Remove trailing null bytes
                 print(f"[WARN] Using first available token: {target_label}")
 
             resolved_pin: Optional[str] = None
@@ -286,8 +288,13 @@ class PDFSigner:
     """Utility class for PDF digital signing"""
 
     def __init__(self, certificate_path: str = None, certificate_password: str = None, token_pin: str = None):
-        self.certificate_path = certificate_path or DEFAULT_CERTIFICATE_PATH
-        self.certificate_password = certificate_password or DEFAULT_CERTIFICATE_PASSWORD
+        cert_path_env = os.environ.get('PDF_SIGNER_CERT_PATH')
+        cert_password_env = os.environ.get('PDF_SIGNER_CERT_PASSWORD')
+        self.certificate_path = certificate_path or cert_path_env or DEFAULT_CERTIFICATE_PATH
+        if certificate_password is None:
+            self.certificate_password = cert_password_env if cert_password_env is not None else DEFAULT_CERTIFICATE_PASSWORD
+        else:
+            self.certificate_password = certificate_password
         self.token_pin = token_pin or os.environ.get('PDF_SIGNER_TOKEN_PIN', DEFAULT_TOKEN_PIN)
         self.pkcs11_library_path = os.environ.get('PDF_SIGNER_PKCS11_LIB', DEFAULT_PKCS11_LIBRARY)
         self.pin_manager = CertificatePinManager(self.pkcs11_library_path)
@@ -297,11 +304,22 @@ class PDFSigner:
         else:
             self.token_label_hints = DEFAULT_TOKEN_LABEL_HINTS
         self.force_hardware_token = os.environ.get('PDF_SIGNER_FORCE_HARDWARE', 'false').lower() in ('1', 'true', 'yes')
+        self.add_visible_signature = os.environ.get('PDF_SIGNER_VISIBLE_TEXT', 'true').lower() in ('1', 'true', 'yes')
+        self._pkcs12_cache = None
+        self._pkcs12_cache_path = None
+        self._pkcs12_cache_mtime = None
+        self._pkcs12_cache_password = None
+        self._pkcs12_lock = threading.Lock()
+        self._hardware_sign_lock = threading.Lock()
+        self._hardware_status_cache = None
+        self._hardware_status_checked_at = 0.0
+        self._hardware_status_ttl_seconds = int(os.environ.get('PDF_SIGNER_TOKEN_STATUS_TTL', '15'))
         self._packages_installed = False
+        self._pkcs11_available = False
 
-    def _ensure_packages_installed(self) -> bool:
+    def _ensure_packages_installed(self, require_pkcs11: bool = False) -> bool:
         """Ensure required packages are available for PDF signing."""
-        if self._packages_installed:
+        if self._packages_installed and (not require_pkcs11 or self._pkcs11_available):
             return True
 
         missing_packages = []
@@ -312,9 +330,22 @@ class PDFSigner:
             missing_packages.append('endesive')
 
         try:
-            import PyKCS11  # noqa: F401
+            import requests  # noqa: F401
         except ImportError:
-            missing_packages.append('PyKCS11')
+            missing_packages.append('requests')
+
+        try:
+            import paramiko  # noqa: F401
+        except ImportError:
+            missing_packages.append('paramiko')
+
+        if require_pkcs11:
+            try:
+                import PyKCS11  # noqa: F401
+                self._pkcs11_available = True
+            except ImportError:
+                missing_packages.append('PyKCS11')
+                self._pkcs11_available = False
 
         try:
             import cryptography  # noqa: F401
@@ -334,11 +365,15 @@ class PDFSigner:
         try:
             from Cryptodome.Cipher import AES  # noqa: F401
         except ImportError:
-            missing_packages.append('pycryptodomex')
-        try:
-            from reportlab.pdfgen import canvas  # noqa: F401
-        except ImportError:
-            missing_packages.append('reportlab')
+            try:
+                from Crypto.Cipher import AES  # noqa: F401
+            except ImportError:
+                missing_packages.append('pycryptodome')
+        if self.add_visible_signature:
+            try:
+                from reportlab.pdfgen import canvas  # noqa: F401
+            except ImportError:
+                missing_packages.append('reportlab')
 
         if missing_packages:
             print('[ERROR] Missing required packages for PDF signing: ' + ', '.join(missing_packages))
@@ -368,8 +403,60 @@ class PDFSigner:
         except Exception as record_error:
             print(f"[WARN] Failed to record token authentication status: {record_error}")
 
+    def get_pkcs12_status(self) -> Dict[str, Any]:
+        """Check whether a PKCS#12 certificate file is configured and present."""
+        status: Dict[str, Any] = {
+            "certificate_path": self.certificate_path,
+            "configured": False,
+            "available": False,
+            "error": None,
+        }
+
+        if not self.certificate_path:
+            status["error"] = "PKCS#12 certificate path not configured"
+            return status
+
+        if not os.path.exists(self.certificate_path):
+            status["error"] = f"PKCS#12 certificate not found at {self.certificate_path}"
+            return status
+
+        status["configured"] = True
+        status["available"] = True
+        return status
+
+    def get_signing_status(self) -> Dict[str, Any]:
+        """Return combined signing availability status for PKCS#12 and hardware token."""
+        pkcs12_status = self.get_pkcs12_status()
+        hardware_status = None
+        hardware_checked = False
+
+        if self.force_hardware_token or not pkcs12_status.get("available"):
+            hardware_status = self.get_hardware_token_status()
+            hardware_checked = True
+
+        available = bool(pkcs12_status.get("available"))
+        if self.force_hardware_token:
+            available = bool(hardware_status and hardware_status.get("available"))
+        elif not available:
+            available = bool(hardware_status and hardware_status.get("available"))
+
+        return {
+            "available": available,
+            "pkcs12": pkcs12_status,
+            "hardware": hardware_status,
+            "hardware_checked": hardware_checked,
+        }
+
     def get_hardware_token_status(self) -> Dict[str, Any]:
         """Check hardware token availability and certificate presence."""
+        now = time.monotonic()
+        if (
+            self._hardware_status_cache is not None
+            and self._hardware_status_ttl_seconds > 0
+            and now - self._hardware_status_checked_at < self._hardware_status_ttl_seconds
+        ):
+            return self._hardware_status_cache.copy()
+
         status: Dict[str, Any] = {
             "library_path": self.pkcs11_library_path,
             "token_present": False,
@@ -438,6 +525,8 @@ class PDFSigner:
             status["error"] = str(error)
 
         status["available"] = bool(status.get("token_present") and status.get("certificate_found") and not status.get("error"))
+        self._hardware_status_cache = status.copy()
+        self._hardware_status_checked_at = now
         return status
 
     def is_hardware_token_ready(self) -> bool:
@@ -497,7 +586,7 @@ class PDFSigner:
         writer = PdfWriter()
         page_total = len(reader.pages)
         for index, page in enumerate(reader.pages):
-            if page_total and index == page_total - 1:
+            if self.add_visible_signature and page_total and index == page_total - 1:
                 try:
                     overlay_page = self._build_signature_overlay(
                         float(page.mediabox.width),
@@ -589,7 +678,14 @@ class PDFSigner:
         try:
             print(f"Attempting to digitally sign PDF for: {signer_name}")
 
-            if not self._ensure_packages_installed():
+            if isinstance(pdf_data, memoryview):
+                pdf_data = pdf_data.tobytes()
+            elif isinstance(pdf_data, bytearray):
+                pdf_data = bytes(pdf_data)
+
+            pkcs12_status = self.get_pkcs12_status()
+            require_pkcs11 = self.force_hardware_token or not pkcs12_status.get("available")
+            if not self._ensure_packages_installed(require_pkcs11=require_pkcs11):
                 return {
                     "success": False,
                     "error": "Required packages not available",
@@ -639,8 +735,10 @@ class PDFSigner:
 
             signed_pdf_data = None
             signer_source = None
+            pkcs12_error = None
+            pkcs12_available = bool(pkcs12_status.get("available") and pkcs12 is not None)
 
-            if not self.force_hardware_token and pkcs12 is not None:
+            if not self.force_hardware_token and pkcs12_available:
                 try:
                     signed_pdf_data = self._sign_with_pkcs12(
                         pdf,
@@ -650,8 +748,10 @@ class PDFSigner:
                     )
                     signer_source = "PKCS#12 certificate"
                 except FileNotFoundError:
-                    print(f"Certificate file not found: {self.certificate_path}")
+                    pkcs12_error = f"Certificate file not found: {self.certificate_path}"
+                    print(pkcs12_error)
                 except Exception as certificate_error:
+                    pkcs12_error = str(certificate_error)
                     print(f"PKCS#12 signing failed: {certificate_error}")
 
             if signed_pdf_data is None:
@@ -665,9 +765,15 @@ class PDFSigner:
                     signer_source = "hardware token"
                 except Exception as token_error:
                     print(f"Hardware token signing failed: {token_error}")
+                    if pkcs12_error:
+                        error_detail = f"Hardware token signing failed: {token_error}. PKCS#12 error: {pkcs12_error}"
+                    elif pkcs12_status.get("available") is False:
+                        error_detail = f"Hardware token signing failed: {token_error}. PKCS#12 unavailable: {pkcs12_status.get('error')}"
+                    else:
+                        error_detail = str(token_error)
                     return {
                         "success": False,
-                        "error": str(token_error),
+                        "error": error_detail,
                         "signed_pdf": pdf_data,
                         "signed_by": signer_name,
                         "signed_on": None,
@@ -738,6 +844,44 @@ class PDFSigner:
 
         return signature_dict
 
+    def _load_pkcs12_materials(self, pkcs12_module):
+        if self.certificate_path and not os.path.exists(self.certificate_path):
+            raise FileNotFoundError(self.certificate_path)
+
+        cert_path = Path(self.certificate_path)
+        cert_mtime = cert_path.stat().st_mtime
+        password_value = self.certificate_password
+        password_bytes = None
+        if password_value is not None and password_value != "":
+            password_bytes = password_value.encode()
+
+        with self._pkcs12_lock:
+            if (
+                self._pkcs12_cache is not None
+                and self._pkcs12_cache_path == str(cert_path)
+                and self._pkcs12_cache_mtime == cert_mtime
+                and self._pkcs12_cache_password == password_value
+            ):
+                return self._pkcs12_cache
+
+            with open(cert_path, 'rb') as cert_file:
+                cert_data = cert_file.read()
+
+            private_key, certificate, additional_certificates = pkcs12_module.load_key_and_certificates(
+                cert_data,
+                password_bytes,
+            )
+
+            if private_key is None or certificate is None:
+                raise ValueError('PKCS#12 archive does not contain both certificate and private key')
+
+            other_certs = list(additional_certificates or [])
+            self._pkcs12_cache = (private_key, certificate, other_certs)
+            self._pkcs12_cache_path = str(cert_path)
+            self._pkcs12_cache_mtime = cert_mtime
+            self._pkcs12_cache_password = password_value
+            return self._pkcs12_cache
+
     def _sign_with_pkcs12(
         self,
         pdf_module,
@@ -745,23 +889,10 @@ class PDFSigner:
         pdf_data: bytes,
         signature_dict: Dict[str, Any],
     ) -> bytes:
-        if self.certificate_path and not os.path.exists(self.certificate_path):
-            raise FileNotFoundError(self.certificate_path)
         if pkcs12_module is None:
             raise RuntimeError('cryptography pkcs12 module is unavailable')
 
-        with open(self.certificate_path, 'rb') as cert_file:
-            cert_data = cert_file.read()
-
-        private_key, certificate, additional_certificates = pkcs12_module.load_key_and_certificates(
-            cert_data,
-            self.certificate_password.encode(),
-        )
-
-        if private_key is None or certificate is None:
-            raise ValueError('PKCS#12 archive does not contain both certificate and private key')
-
-        other_certs = list(additional_certificates or [])
+        private_key, certificate, other_certs = self._load_pkcs12_materials(pkcs12_module)
 
         signature_increment = pdf_module.cms.sign(
             pdf_data,
@@ -784,55 +915,56 @@ class PDFSigner:
         pdf_data: bytes,
         signature_dict: Dict[str, Any],
     ) -> bytes:
-        with SafeNetTokenSigner(
-            self.token_pin,
-            self.pkcs11_library_path,
-            self.token_label_hints,
-            pin_resolver=self._resolve_token_pin,
-            auth_callback=self._on_token_auth,
-        ) as token_signer:
-            token_signer.login()
-            certificate_tuple = token_signer.certificate()
-            certificate_id_hex: Optional[str] = None
-            if certificate_tuple:
-                cert_identifier = certificate_tuple[0]
-                if isinstance(cert_identifier, (bytes, bytearray)):
-                    certificate_id_hex = cert_identifier.hex().upper()
-                elif cert_identifier is not None:
-                    certificate_id_hex = str(cert_identifier)
-            if self.pin_manager and token_signer.token_label and certificate_id_hex:
-                try:
-                    self.pin_manager.record_validation(token_signer.token_label, certificate_id_hex, True, None)
-                except Exception as record_error:
-                    print(f"[WARN] Failed to record certificate PIN validation: {record_error}")
+        with self._hardware_sign_lock:
+            with SafeNetTokenSigner(
+                self.token_pin,
+                self.pkcs11_library_path,
+                self.token_label_hints,
+                pin_resolver=self._resolve_token_pin,
+                auth_callback=self._on_token_auth,
+            ) as token_signer:
+                token_signer.login()
+                certificate_tuple = token_signer.certificate()
+                certificate_id_hex: Optional[str] = None
+                if certificate_tuple:
+                    cert_identifier = certificate_tuple[0]
+                    if isinstance(cert_identifier, (bytes, bytearray)):
+                        certificate_id_hex = cert_identifier.hex().upper()
+                    elif cert_identifier is not None:
+                        certificate_id_hex = str(cert_identifier)
+                if self.pin_manager and token_signer.token_label and certificate_id_hex:
+                    try:
+                        self.pin_manager.record_validation(token_signer.token_label, certificate_id_hex, True, None)
+                    except Exception as record_error:
+                        print(f"[WARN] Failed to record certificate PIN validation: {record_error}")
 
-            class _TokenHSMBridge(hsm_module.BaseHSM):
-                def __init__(self, signer, cert_tuple):
-                    self.signer = signer
-                    self.cert_tuple = cert_tuple
+                class _TokenHSMBridge(hsm_module.BaseHSM):
+                    def __init__(self, signer, cert_tuple):
+                        self.signer = signer
+                        self.cert_tuple = cert_tuple
 
-                def certificate(self):
-                    return self.cert_tuple
+                    def certificate(self):
+                        return self.cert_tuple
 
-                def sign(self, keyid, data, mech):
-                    return self.signer.sign(keyid, data, mech)
+                    def sign(self, keyid, data, mech):
+                        return self.signer.sign(keyid, data, mech)
 
-            hsm_bridge = _TokenHSMBridge(token_signer, certificate_tuple)
+                hsm_bridge = _TokenHSMBridge(token_signer, certificate_tuple)
 
-            signature_increment = pdf_module.cms.sign(
-                pdf_data,
-                signature_dict,
-                None,
-                None,
-                [],
-                'sha256',
-                hsm_bridge,
-            )
+                signature_increment = pdf_module.cms.sign(
+                    pdf_data,
+                    signature_dict,
+                    None,
+                    None,
+                    [],
+                    'sha256',
+                    hsm_bridge,
+                )
 
-            if not signature_increment:
-                raise ValueError('PDF signing library returned empty signature data')
+                if not signature_increment:
+                    raise ValueError('PDF signing library returned empty signature data')
 
-            return pdf_data + signature_increment
+                return pdf_data + signature_increment
 
 
     def sign_pdf_with_token(
@@ -852,7 +984,12 @@ class PDFSigner:
         try:
             print(f"Attempting to sign PDF with hardware token for: {signer_name}")
 
-            if not self._ensure_packages_installed():
+            if isinstance(pdf_data, memoryview):
+                pdf_data = pdf_data.tobytes()
+            elif isinstance(pdf_data, bytearray):
+                pdf_data = bytes(pdf_data)
+
+            if not self._ensure_packages_installed(require_pkcs11=True):
                 return {
                     "success": False,
                     "error": "Required packages not available",

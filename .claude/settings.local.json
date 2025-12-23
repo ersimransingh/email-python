@@ -13,7 +13,9 @@
       "Bash(curl:*)",
       "Bash(telnet:*)",
       "Bash(powershell:*)",
-      "Bash(where python)"
+      "Bash(where python)",
+      "Bash(timeout 10 openssl s_client:*)",
+      "Bash(timeout 15 openssl:*)"
     ],
     "deny": [],
     "ask": []

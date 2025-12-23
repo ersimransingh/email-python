@@ -251,7 +251,7 @@ class CertificatePinManager:
                     last_error = str(slot_info_error)
                     continue
 
-                slot_label = (token_info.label or "").strip()
+                slot_label = (token_info.label or "").strip().rstrip('\x00')  # Remove trailing null bytes
                 slot_matches_label = (
                     not normalised_label or self._normalise(slot_label) == normalised_label
                 )
@@ -266,7 +266,7 @@ class CertificatePinManager:
                     if slot == slot_id:
                         try:
                             token_info = pkcs11.getTokenInfo(slot)
-                            candidate_slots.append((slot, (token_info.label or "").strip()))
+                            candidate_slots.append((slot, (token_info.label or "").strip().rstrip('\x00')))
                         except Exception as slot_info_error:
                             last_error = str(slot_info_error)
                         break
