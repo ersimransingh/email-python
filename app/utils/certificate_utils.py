@@ -145,6 +145,7 @@ def get_all_hardware_certificates() -> List[Dict[str, Any]]:
         if sys.platform == 'win32':
             possible_paths = [
                 os.path.join(os.environ.get('SYSTEMROOT', 'C:\\Windows'), 'System32', 'eTPKCS11.dll'),
+                r"C:\Windows\System32\SignatureP11.dll",
                 r"C:\Windows\system32\cryptoida_pkcs11.dll",
             ]
             for path in possible_paths:
