@@ -35,6 +35,8 @@ PyKCS11>=1.5.18
 reportlab>=4.0.0
 cryptography>=46.0.0
 asn1crypto>=1.5.1
+requests>=2.32.0
+paramiko>=3.4.0
 
 # Process Management
 psutil>=5.9.0
