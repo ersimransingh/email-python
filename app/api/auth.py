@@ -1,26 +1,30 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from typing import Optional, Dict, Any
 from datetime import datetime
 
 from app.core.security import SecurityManager
 from app.models.auth import LoginRequest, LoginResponse, TokenVerifyResponse
 
 router = APIRouter()
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 security_manager = SecurityManager()
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Dependency to get current authenticated user"""
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Dict[str, Any]:
+    """Dependency to get current authenticated user (optional)."""
+    if credentials is None:
+        return {"authenticated": False, "username": None}
+
     try:
         payload = security_manager.verify_token(credentials.credentials)
-        return payload
+        user = dict(payload)
+        user["authenticated"] = True
+        return user
     except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        return {"authenticated": False, "username": None, "token_invalid": True}
 
 
 @router.post("/authenticate", response_model=LoginResponse)
@@ -73,6 +77,15 @@ async def authenticate(request: LoginRequest):
 @router.get("/authenticate", response_model=TokenVerifyResponse)
 async def verify_token(current_user: dict = Depends(get_current_user)):
     """Verify JWT token"""
+    if not current_user.get("authenticated"):
+        message = "No token provided"
+        if current_user.get("token_invalid"):
+            message = "Invalid authentication token"
+        return TokenVerifyResponse(
+            success=False,
+            message=message
+        )
+
     return TokenVerifyResponse(
         success=True,
         user={"username": current_user.get("username")},
