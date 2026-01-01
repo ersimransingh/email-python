@@ -1,6 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends, status
-from typing import List
+import base64
 from datetime import datetime
+from typing import List
+
+from fastapi import APIRouter, HTTPException, Depends, status
 
 from app.core.config import EmailConfig
 from app.models.email import (
@@ -8,7 +10,7 @@ from app.models.email import (
     EmailProcessResponse, DashboardResponse, CertificateStatusResponse,
     AllCertificatesResponse, CertificatePinSetRequest,
     CertificatePinSetResponse, CertificatePinStatusResponse,
-    HardwareCertificatePinStatus
+    HardwareCertificatePinStatus, SignStringRequest, SignStringResponse
 )
 from app.services.email_service import email_service
 from app.services.email_worker import email_worker
@@ -313,6 +315,48 @@ async def get_certificate_pin_status(
         total_certificates=len(statuses),
         certificates=statuses,
         error=None
+    )
+
+
+@router.post("/sign-string", response_model=SignStringResponse)
+async def sign_string(
+    request: SignStringRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Sign an arbitrary string and return base64 signature."""
+    if request.data == "":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="data is required"
+        )
+
+    try:
+        encoding = request.encoding or "utf-8"
+        data_bytes = request.data.encode(encoding)
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported encoding: {request.encoding}"
+        )
+
+    sign_result = email_service.pdf_signer.sign_data(data_bytes)
+    if not sign_result.get("success"):
+        return SignStringResponse(
+            success=False,
+            signature_base64=None,
+            signer_source=sign_result.get("signer_source"),
+            algorithm=sign_result.get("algorithm"),
+            error=sign_result.get("error"),
+        )
+
+    signature_bytes = sign_result.get("signature") or b""
+    signature_base64 = base64.b64encode(signature_bytes).decode("ascii")
+    return SignStringResponse(
+        success=True,
+        signature_base64=signature_base64,
+        signer_source=sign_result.get("signer_source"),
+        algorithm=sign_result.get("algorithm"),
+        error=None,
     )
 
 

@@ -448,6 +448,143 @@ class PDFSigner:
             "hardware_checked": hardware_checked,
         }
 
+    def sign_data(self, data: bytes) -> Dict[str, Any]:
+        """Sign arbitrary bytes using PKCS#12 or hardware token."""
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        elif isinstance(data, bytearray):
+            data = bytes(data)
+
+        if not data:
+            return {
+                "success": False,
+                "signature": None,
+                "signer_source": None,
+                "algorithm": None,
+                "error": "No data provided for signing",
+            }
+
+        pkcs12_status = self.get_pkcs12_status()
+        signature = None
+        signer_source = None
+        algorithm = None
+        pkcs12_error = None
+        token_error = None
+
+        if not pkcs12_status.get("available") and not self.force_hardware_token:
+            pkcs12_error = pkcs12_status.get("error") or "PKCS#12 certificate unavailable"
+
+        if not self.force_hardware_token and pkcs12_status.get("available"):
+            try:
+                from cryptography.hazmat.primitives import hashes
+                from cryptography.hazmat.primitives.asymmetric import padding, rsa, ec, dsa
+                from cryptography.hazmat.primitives.serialization import pkcs12 as pkcs12_module
+            except ImportError as exc:
+                pkcs12_error = f"cryptography import error: {exc}"
+            else:
+                try:
+                    private_key, _certificate, _other_certs = self._load_pkcs12_materials(pkcs12_module)
+                    if isinstance(private_key, rsa.RSAPrivateKey):
+                        signature = private_key.sign(
+                            data,
+                            padding.PKCS1v15(),
+                            hashes.SHA256(),
+                        )
+                        algorithm = "SHA256-RSA"
+                    elif isinstance(private_key, ec.EllipticCurvePrivateKey):
+                        signature = private_key.sign(
+                            data,
+                            ec.ECDSA(hashes.SHA256()),
+                        )
+                        algorithm = "SHA256-ECDSA"
+                    elif isinstance(private_key, dsa.DSAPrivateKey):
+                        signature = private_key.sign(
+                            data,
+                            hashes.SHA256(),
+                        )
+                        algorithm = "SHA256-DSA"
+                    else:
+                        signature = private_key.sign(
+                            data,
+                            hashes.SHA256(),
+                        )
+                        algorithm = "SHA256"
+                    signer_source = "PKCS#12 certificate"
+                except Exception as exc:
+                    pkcs12_error = str(exc)
+                    signature = None
+
+        if signature is None:
+            try:
+                import PyKCS11  # noqa: F401
+            except ImportError as exc:
+                token_error = f"PyKCS11 import error: {exc}"
+            else:
+                try:
+                    with SafeNetTokenSigner(
+                        self.token_pin,
+                        self.pkcs11_library_path,
+                        self.token_label_hints,
+                        pin_resolver=self._resolve_token_pin,
+                        auth_callback=self._on_token_auth,
+                    ) as token_signer:
+                        token_signer.login()
+                        certificate_tuple = token_signer.certificate()
+                        if not certificate_tuple:
+                            raise RuntimeError("No certificates found on token")
+                        cert_identifier = certificate_tuple[0]
+                        signature = token_signer.sign(cert_identifier, data, "sha256")
+                        signer_source = "hardware token"
+                        algorithm = "SHA256-RSA"
+                        certificate_id_hex = None
+                        if isinstance(cert_identifier, (bytes, bytearray)):
+                            certificate_id_hex = cert_identifier.hex().upper()
+                        elif cert_identifier is not None:
+                            certificate_id_hex = str(cert_identifier)
+                        if self.pin_manager and token_signer.token_label and certificate_id_hex:
+                            try:
+                                self.pin_manager.record_validation(
+                                    token_signer.token_label,
+                                    certificate_id_hex,
+                                    True,
+                                    None,
+                                )
+                            except Exception as record_error:
+                                print(f"[WARN] Failed to record certificate PIN validation: {record_error}")
+                except Exception as exc:
+                    token_error = str(exc)
+                    signature = None
+
+        if signature is None:
+            if self.force_hardware_token:
+                error_detail = f"Hardware token signing failed: {token_error or 'Unknown error'}"
+            elif pkcs12_error and token_error:
+                error_detail = (
+                    f"PKCS#12 signing failed: {pkcs12_error}. "
+                    f"Hardware token signing failed: {token_error}"
+                )
+            elif pkcs12_error:
+                error_detail = f"PKCS#12 signing failed: {pkcs12_error}"
+            elif token_error:
+                error_detail = f"Hardware token signing failed: {token_error}"
+            else:
+                error_detail = "Signing failed"
+            return {
+                "success": False,
+                "signature": None,
+                "signer_source": signer_source,
+                "algorithm": algorithm,
+                "error": error_detail,
+            }
+
+        return {
+            "success": True,
+            "signature": signature,
+            "signer_source": signer_source,
+            "algorithm": algorithm,
+            "error": None,
+        }
+
     def get_hardware_token_status(self) -> Dict[str, Any]:
         """Check hardware token availability and certificate presence."""
         now = time.monotonic()

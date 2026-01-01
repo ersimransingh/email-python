@@ -174,6 +174,7 @@ async def api_info():
                 "GET /api/certificates - List all certificates on the computer",
                 "POST /api/certificates/pins - Save hardware certificate PINs",
                 "GET /api/certificates/pins/status - Check stored certificate PIN status",
+                "POST /api/sign-string - Sign a string and return base64 signature",
                 "POST /api/email-test - Send test email",
                 "POST /api/email-force-process - Force process email queue",
                 "GET /api/dashboard - Get dashboard data"

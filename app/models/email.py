@@ -40,6 +40,19 @@ class CertificateStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+class SignStringRequest(BaseModel):
+    data: str
+    encoding: Optional[str] = "utf-8"
+
+
+class SignStringResponse(BaseModel):
+    success: bool
+    signature_base64: Optional[str] = None
+    signer_source: Optional[str] = None
+    algorithm: Optional[str] = None
+    error: Optional[str] = None
+
+
 class ServiceControlRequest(BaseModel):
     action: str  # "start" or "stop"
     user: str
