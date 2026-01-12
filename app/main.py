@@ -1,13 +1,22 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
 
 from app.api import auth, database, email, service
 from app.core.config import settings
 from app.services.database_manager import db_manager
 from app.services.email_worker import email_worker
+
+
+if load_dotenv:
+    load_dotenv()
 
 
 @asynccontextmanager
@@ -44,6 +53,27 @@ async def lifespan(app: FastAPI):
         print(f"Warning: Error during cleanup: {e}")
 
 
+def _normalize_root_path(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if not value.startswith("/"):
+        value = f"/{value}"
+    value = value.rstrip("/")
+    return value
+
+
+ROOT_PATH = _normalize_root_path(os.getenv("API_ROOT_PATH", ""))
+
+
+def _with_root_path(path: str) -> str:
+    if not ROOT_PATH:
+        return path
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"{ROOT_PATH}{path}"
+
+
 app = FastAPI(
     title="Email Service API",
     description="""
@@ -65,6 +95,7 @@ app = FastAPI(
     - 🛠️ Service control (start/stop)
     """,
     version="1.0.0",
+    root_path=ROOT_PATH,
     lifespan=lifespan
 )
 
@@ -106,8 +137,8 @@ async def root():
         "message": "Email Service API is running",
         "version": "1.0.0",
         "status": "healthy",
-        "docs_url": "/docs",
-        "redoc_url": "/redoc"
+        "docs_url": _with_root_path("/docs"),
+        "redoc_url": _with_root_path("/redoc")
     }
 
 
@@ -185,9 +216,9 @@ async def api_info():
             ]
         },
         "documentation": {
-            "swagger_ui": "/docs",
-            "redoc": "/redoc",
-            "openapi_json": "/openapi.json"
+            "swagger_ui": _with_root_path("/docs"),
+            "redoc": _with_root_path("/redoc"),
+            "openapi_json": _with_root_path("/openapi.json")
         }
     }
 
